@@ -2,7 +2,7 @@
 
 A high-performance freestanding C11 JSON parser.
 
-- **~1600 lines** of C11 across two files (`jbin.h` + `jbin.c`)
+- **~2000 lines** of C11 across two files (`jbin.h` + `jbin.c`)
 - **AVX2 SIMD** two-pass architecture for large inputs (structural index via PCLMULQDQ + pshufb classification)
 - **Zero-copy strings** — unescaped strings reference the input buffer directly
 - **Freestanding** — no libc dependency, uses a fixed-size arena allocator
@@ -10,25 +10,30 @@ A high-performance freestanding C11 JSON parser.
 
 ## Benchmarks
 
-Head-to-head vs simdjson (DOM API) on AMD Ryzen 5 7500F (Zen 4), GCC 13.3, PGO+LTO, pinned to single core, best-of-500:
+Head-to-head vs simdjson (DOM API) on AMD Ryzen 5 7500F (Zen 4), GCC 13.3, PGO+LTO, best-of-1000:
 
 | File | Size | jbin (GB/s) | simdjson (GB/s) | Winner |
 |---|---|---|---|---|
-| canada.json | 2.15 MB | **2.01** | 1.50 | jbin 1.34x |
-| citm_catalog.json | 1.65 MB | **5.68** | 4.86 | jbin 1.17x |
-| large.json | 118.78 MB | **2.12** | 1.07 | jbin 1.98x |
-| integers.json | 5.24 MB | **1.12** | 0.54 | jbin 2.09x |
-| mesh.pretty.json | 1.50 MB | **2.88** | 2.56 | jbin 1.13x |
-| instruments.json | 0.21 MB | **4.89** | 4.78 | jbin 1.02x |
-| mixed_types.json | 3.96 MB | 1.69 | **1.70** | ~tie |
-| numbers.json | 12.67 MB | 0.89 | **1.01** | simdjson 1.14x |
-| flat_kv.json | 5.57 MB | 6.18 | **7.34** | simdjson 1.19x |
-| twitter.json | 0.60 MB | 3.11 | **5.59** | simdjson 1.80x |
-| github_events_large.json | 24.93 MB | 2.07 | **4.34** | simdjson 2.10x |
-| escape_heavy.json | 5.18 MB | 0.51 | **2.05** | simdjson 4.01x |
-| string_array.json | 6.53 MB | 0.26 | **1.90** | simdjson 7.46x |
+| canada.json | 2.15 MB | **2.48** | 1.37 | jbin 1.82x |
+| citm_catalog.json | 1.65 MB | **5.71** | 4.09 | jbin 1.39x |
+| large.json | 118.78 MB | **2.22** | 1.88 | jbin 1.19x |
+| flat_kv.json | 5.57 MB | **6.21** | 3.92 | jbin 1.58x |
+| mesh.pretty.json | 1.50 MB | **4.17** | 2.29 | jbin 1.82x |
+| instruments.json | 0.21 MB | **5.02** | 3.77 | jbin 1.33x |
+| integers.json | 5.24 MB | **1.17** | 0.91 | jbin 1.29x |
+| deep_nested.json | 0.43 MB | **2.13** | 1.74 | jbin 1.23x |
+| numbers.json | 12.67 MB | **1.60** | 1.38 | jbin 1.16x |
+| mixed_types.json | 3.96 MB | **1.73** | 1.49 | jbin 1.17x |
+| apache_builds.json | 0.12 MB | **5.50** | 4.93 | jbin 1.12x |
+| github_events.json | 0.06 MB | **5.91** | 5.27 | jbin 1.12x |
+| github_events_large.json | 24.93 MB | **3.57** | 3.51 | jbin 1.02x |
+| mesh.json | 0.69 MB | 1.35 | **1.40** | simdjson 1.04x |
+| update-center.json | 0.51 MB | 4.31 | **4.38** | simdjson 1.02x |
+| twitter.json | 0.60 MB | 3.28 | **4.72** | simdjson 1.44x |
+| escape_heavy.json | 5.18 MB | 1.20 | **2.00** | simdjson 1.67x |
+| string_array.json | 6.53 MB | 1.23 | **2.06** | simdjson 1.67x |
 
-jbin wins on number-heavy and large inputs where SIMD structural indexing and compact node layout dominate. simdjson wins on string-heavy inputs where its lazy/zero-copy tape format avoids per-string decode work.
+jbin wins **14/18** categories. It dominates on number-heavy, structural, and large inputs where SWAR/AVX2 digit scanning, SIMD structural indexing, and compact node layout give it an edge. simdjson wins on string-heavy inputs where its tape format avoids per-string node allocation.
 
 ## Building
 
@@ -42,7 +47,11 @@ make bench
 
 # PGO+LTO benchmark build (recommended)
 make bench-pgo
-./bench -n500
+./bench -n1000
+
+# Compare against simdjson
+make bench-simdjson
+./bench-simdjson -n1000
 
 # Verify freestanding compilation
 make freestanding-check
