@@ -1,4 +1,5 @@
 CC       ?= cc
+CXX      ?= c++
 CFLAGS    = -Wall -Wextra -Wpedantic -std=c11 -O2
 BENCHFLAGS = -O3 -march=native -std=c11 -fno-stack-protector -fno-asynchronous-unwind-tables
 
@@ -22,9 +23,13 @@ bench-pgo: bench.c jbin.c jbin.h
 	@echo "Training PGO profile..."
 	@for i in 1 2 3 4 5; do ./bench data/twitter.json data/citm_catalog.json >/dev/null; done
 	@./bench data/canada.json data/large.json >/dev/null
+	@for i in 1 2 3; do ./bench data/numbers.json data/mesh.json >/dev/null 2>/dev/null || true; done
 	$(CC) $(BENCHFLAGS) $(ARENA) -fprofile-use -flto -o bench bench.c jbin.c
 	@rm -f *.gcda
 	@echo "PGO build complete. Run: ./bench -n100"
+
+bench-simdjson: bench_simdjson.cpp simdjson/simdjson.h simdjson/simdjson.cpp
+	$(CXX) -O3 -march=native -o $@ bench_simdjson.cpp simdjson/simdjson.cpp
 
 check: test_runner
 	./test_runner
@@ -46,6 +51,6 @@ freestanding-check: jbin.c jbin.h
 	@echo "freestanding compilation OK"
 
 clean:
-	rm -f test_runner bench bench_pgo_gen *.o *.gcda
+	rm -f test_runner bench bench-simdjson *.o *.gcda
 
 .PHONY: all check check-v check-suite check-suite-v freestanding-check clean bench-pgo

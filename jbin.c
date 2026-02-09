@@ -26,6 +26,38 @@
   #define NOINLINE     static
 #endif
 
+FINLINE int is_8_digits(const uint8_t *ptr) {
+    uint64_t val;
+    __builtin_memcpy(&val, ptr, 8);
+    return ((val & 0xF0F0F0F0F0F0F0F0ULL) |
+            (((val + 0x0606060606060606ULL) & 0xF0F0F0F0F0F0F0F0ULL) >> 4))
+           == 0x3333333333333333ULL;
+}
+
+FINLINE void skip_digits(const uint8_t **cur, const uint8_t *end) {
+    while (*cur + 8 <= end && is_8_digits(*cur)) *cur += 8;
+    while (*cur < end && (uint32_t)(**cur - '0') <= 9u) (*cur)++;
+}
+
+FINLINE void skip_digits_nobound(const uint8_t **cur) {
+#ifdef JBIN_AVX2
+    {
+        const __m256i v2f = _mm256_set1_epi8(0x2F);
+        const __m256i v3a = _mm256_set1_epi8(0x3A);
+        __m256i v = _mm256_loadu_si256((const __m256i *)*cur);
+        uint32_t mask = (uint32_t)_mm256_movemask_epi8(
+            _mm256_and_si256(_mm256_cmpgt_epi8(v, v2f), _mm256_cmpgt_epi8(v3a, v)));
+        if (LIKELY(mask != 0xFFFFFFFFu)) {
+            *cur += __builtin_ctz(~mask);
+            return;
+        }
+        *cur += 32;
+    }
+#endif
+    while (is_8_digits(*cur)) *cur += 8;
+    while ((uint32_t)(**cur - '0') <= 9u) (*cur)++;
+}
+
 #define X 0xFF
 static const uint8_t HEX[256] = {
     X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X,
@@ -46,6 +78,12 @@ static const uint8_t HEX[256] = {
     X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X,
 };
 #undef X
+
+static const uint8_t ESC[256] = {
+    ['"']  = 0x22, ['\\'] = 0x5C, ['/'] = 0x2F,
+    ['b']  = 0x08, ['f']  = 0x0C, ['n'] = 0x0A,
+    ['r']  = 0x0D, ['t']  = 0x09,
+};
 
 typedef struct {
     const uint8_t *cur;
@@ -228,6 +266,85 @@ FINLINE int arena_bulk(P *p, const uint8_t *src, uint32_t n) {
     return 1;
 }
 
+FINLINE const uint8_t *scan_copy_string(P *p, const uint8_t *cur) {
+    uint8_t *dst = (uint8_t *)p->arena->strings + p->arena->string_used;
+    uint32_t capacity = JBIN_MAX_STRING - p->arena->string_used;
+    uint32_t n = 0;
+
+#ifdef JBIN_AVX2
+    {
+        const __m256i vq  = _mm256_set1_epi8('"');
+        const __m256i vbs = _mm256_set1_epi8('\\');
+        const __m256i vxr = _mm256_set1_epi8((char)0x80);
+        const __m256i vth = _mm256_set1_epi8((char)0xA0);
+
+        while (cur + 32 <= p->end && n + 32 <= capacity) {
+            __m256i v = _mm256_loadu_si256((const __m256i *)cur);
+            uint32_t qmask = (uint32_t)_mm256_movemask_epi8(
+                _mm256_cmpeq_epi8(v, vq));
+            uint32_t bmask = (uint32_t)_mm256_movemask_epi8(
+                _mm256_cmpeq_epi8(v, vbs));
+            if (LIKELY(!(qmask | bmask))) {
+                _mm256_storeu_si256((__m256i *)(dst + n), v);
+                n += 32;
+                cur += 32;
+                continue;
+            }
+            uint32_t cmask = (uint32_t)_mm256_movemask_epi8(
+                _mm256_cmpgt_epi8(vth, _mm256_xor_si256(v, vxr)));
+            uint32_t pos = (uint32_t)__builtin_ctz(qmask | bmask | cmask);
+            _mm256_storeu_si256((__m256i *)(dst + n), v);
+            p->arena->string_used += n + pos;
+            return cur + pos;
+        }
+    }
+#elif defined(JBIN_SSE2)
+    {
+        const __m128i vq  = _mm_set1_epi8('"');
+        const __m128i vbs = _mm_set1_epi8('\\');
+        const __m128i vxr = _mm_set1_epi8((char)0x80);
+        const __m128i vth = _mm_set1_epi8((char)0xA0);
+
+        while (cur + 16 <= p->end && n + 16 <= capacity) {
+            __m128i v = _mm_loadu_si128((const __m128i *)cur);
+            uint32_t qmask = (uint32_t)_mm_movemask_epi8(
+                _mm_cmpeq_epi8(v, vq));
+            uint32_t bmask = (uint32_t)_mm_movemask_epi8(
+                _mm_cmpeq_epi8(v, vbs));
+            if (LIKELY(!(qmask | bmask))) {
+                _mm_storeu_si128((__m128i *)(dst + n), v);
+                n += 16;
+                cur += 16;
+                continue;
+            }
+            uint32_t cmask = (uint32_t)_mm_movemask_epi8(
+                _mm_cmpgt_epi8(vth, _mm_xor_si128(v, vxr)));
+            uint32_t pos = (uint32_t)__builtin_ctz(qmask | bmask | cmask);
+            _mm_storeu_si128((__m128i *)(dst + n), v);
+            p->arena->string_used += n + pos;
+            return cur + pos;
+        }
+    }
+#endif
+
+    while (cur < p->end && n < capacity) {
+        uint8_t c = *cur;
+        if (c == '"' || c == '\\' || c < 0x20) break;
+        dst[n++] = c;
+        cur++;
+    }
+    p->arena->string_used += n;
+
+    if (UNLIKELY(n >= capacity && cur < p->end)) {
+        uint8_t c = *cur;
+        if (c != '"' && c != '\\' && c >= 0x20) {
+            fail(p, JBIN_ERR_STRING_FULL);
+        }
+    }
+
+    return cur;
+}
+
 FINLINE int str_push(P *p, char c) {
     if (UNLIKELY(p->arena->string_used >= JBIN_MAX_STRING)) {
         fail(p, JBIN_ERR_STRING_FULL);
@@ -297,58 +414,8 @@ FINLINE int parse_4hex(P *p, uint32_t *out) {
     return 1;
 }
 
-NOINLINE uint32_t handle_escape(P *p) {
-    if (UNLIKELY(p->cur >= p->end)) {
-        fail(p, JBIN_ERR_UNTERMINATED_STRING);
-        return 0;
-    }
-    uint8_t esc = *p->cur++;
-    switch (esc) {
-        case '"':  return str_push(p, '"');
-        case '\\': return str_push(p, '\\');
-        case '/':  return str_push(p, '/');
-        case 'b':  return str_push(p, '\b');
-        case 'f':  return str_push(p, '\f');
-        case 'n':  return str_push(p, '\n');
-        case 'r':  return str_push(p, '\r');
-        case 't':  return str_push(p, '\t');
-        case 'u': {
-            uint32_t cp;
-            if (UNLIKELY(!parse_4hex(p, &cp))) {
-                fail(p, JBIN_ERR_BAD_UNICODE);
-                return 0;
-            }
-            if (cp >= 0xD800 && cp <= 0xDBFF) {
-                if (UNLIKELY(p->cur + 2 > p->end
-                    || p->cur[0] != '\\'
-                    || p->cur[1] != 'u')) {
-                    fail(p, JBIN_ERR_BAD_UNICODE);
-                    return 0;
-                }
-                p->cur += 2;
-                uint32_t low;
-                if (UNLIKELY(!parse_4hex(p, &low))) {
-                    fail(p, JBIN_ERR_BAD_UNICODE);
-                    return 0;
-                }
-                if (UNLIKELY(low < 0xDC00 || low > 0xDFFF)) {
-                    fail(p, JBIN_ERR_BAD_UNICODE);
-                    return 0;
-                }
-                cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
-            } else if (UNLIKELY(cp >= 0xDC00 && cp <= 0xDFFF)) {
-                fail(p, JBIN_ERR_BAD_UNICODE);
-                return 0;
-            }
-            return encode_utf8(p, cp);
-        }
-        default:
-            fail(p, JBIN_ERR_BAD_ESCAPE);
-            return 0;
-    }
-}
-
-NOINLINE uint32_t parse_string_escape(P *p) {
+#ifdef JBIN_AVX2
+NOINLINE uint32_t parse_string_fused(P *p) {
     if (UNLIKELY(p->cur >= p->end || *p->cur != '"')) {
         fail(p, JBIN_ERR_UNEXPECTED);
         return JBIN_NONE;
@@ -358,56 +425,407 @@ NOINLINE uint32_t parse_string_escape(P *p) {
     uint32_t node = alloc_node(p, JBIN_STRING);
     if (UNLIKELY(node == JBIN_NONE)) return JBIN_NONE;
 
-    const uint8_t *str_begin = p->cur;
-    int dummy;
-    const uint8_t *scan_end = scan_string_end(p->cur, p->end, &dummy);
-
     uint32_t arena_start = p->arena->string_used;
-    uint32_t clean = (uint32_t)(scan_end - str_begin);
-    if (clean > 0) {
-        if (UNLIKELY(!arena_bulk(p, str_begin, clean)))
-            return JBIN_NONE;
-        p->cur = scan_end;
-    }
+    uint8_t *dst_base = (uint8_t *)p->arena->strings + arena_start;
+    uint8_t *dst = dst_base;
+    uint32_t capacity = JBIN_MAX_STRING - arena_start;
+    const uint8_t *src = p->cur;
+    const uint8_t *end = p->end;
+    uint8_t *dst_limit = dst_base + capacity - 31;
+    int has_non_ascii = 0;
 
-    for (;;) {
-        if (UNLIKELY(p->cur >= p->end)) {
-            fail(p, JBIN_ERR_UNTERMINATED_STRING);
+    const __m256i vquote = _mm256_set1_epi8('"');
+    const __m256i vbackslash = _mm256_set1_epi8('\\');
+    const __m256i vxor = _mm256_set1_epi8((char)0x80);
+    const __m256i vthresh = _mm256_set1_epi8((char)0xA0);
+
+    while (src + 32 <= end && dst <= dst_limit) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)src);
+        uint32_t qmask = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vquote));
+        uint32_t bmask = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vbackslash));
+
+        if (LIKELY(!(qmask | bmask))) {
+            _mm256_storeu_si256((__m256i *)dst, v);
+            has_non_ascii |= (int)_mm256_movemask_epi8(v);
+            src += 32;
+            dst += 32;
+            continue;
+        }
+
+        uint32_t cmask = (uint32_t)_mm256_movemask_epi8(
+            _mm256_cmpgt_epi8(vthresh, _mm256_xor_si256(v, vxor)));
+        uint32_t pos = (uint32_t)__builtin_ctz(qmask | bmask | cmask);
+
+        has_non_ascii |= (int)_mm256_movemask_epi8(v);
+        _mm256_storeu_si256((__m256i *)dst, v);
+        dst += pos;
+        src += pos;
+
+        if (UNLIKELY(cmask & (1u << pos))) {
+            p->cur = src;
+            fail(p, JBIN_ERR_CONTROL_CHAR);
             return JBIN_NONE;
         }
 
-        uint8_t c = *p->cur;
-
-        if (c == '"') {
-            uint32_t slen = p->arena->string_used - arena_start;
-            if (UNLIKELY(!validate_utf8(
-                    (const uint8_t *)p->arena->strings + arena_start, slen))) {
+        if (qmask & (1u << pos)) {
+            uint32_t slen = (uint32_t)(dst - dst_base);
+            p->arena->string_used = arena_start + slen;
+            if (UNLIKELY(has_non_ascii && !validate_utf8(dst_base, slen))) {
+                p->cur = src;
                 fail(p, JBIN_ERR_BAD_UTF8);
                 return JBIN_NONE;
             }
             p->arena->nodes[node].str_off = arena_start;
             p->arena->nodes[node].str_len = slen;
-            p->cur++;
+            p->cur = src + 1;
             return node;
         }
 
-        if (c == '\\') {
-            p->cur++;
-            if (UNLIKELY(!handle_escape(p))) return JBIN_NONE;
-            scan_end = scan_string_end(p->cur, p->end, &dummy);
-            clean = (uint32_t)(scan_end - p->cur);
-            if (clean > 0) {
-                if (UNLIKELY(!arena_bulk(p, p->cur, clean)))
+        if (UNLIKELY(src + 1 >= end)) {
+            p->cur = src;
+            fail(p, JBIN_ERR_UNTERMINATED_STRING);
+            return JBIN_NONE;
+        }
+        uint8_t esc_ch = src[1];
+        src += 2;
+        uint8_t rep = ESC[esc_ch];
+        if (LIKELY(rep)) {
+            *dst++ = rep;
+            continue;
+        }
+        if (LIKELY(esc_ch == 'u')) {
+                if (UNLIKELY(src + 4 > end)) {
+                    p->cur = src - 2;
+                    fail(p, JBIN_ERR_BAD_UNICODE);
                     return JBIN_NONE;
-                p->cur = scan_end;
+                }
+                uint8_t a = HEX[src[0]], b = HEX[src[1]];
+                uint8_t c = HEX[src[2]], d = HEX[src[3]];
+                if (UNLIKELY((a | b | c | d) & 0x80)) {
+                    p->cur = src - 2;
+                    fail(p, JBIN_ERR_BAD_UNICODE);
+                    return JBIN_NONE;
+                }
+                uint32_t cp = ((uint32_t)a << 12) | ((uint32_t)b << 8)
+                            | ((uint32_t)c << 4) | d;
+                src += 4;
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                    if (UNLIKELY(src + 6 > end || src[0] != '\\' || src[1] != 'u')) {
+                        p->cur = src - 6;
+                        fail(p, JBIN_ERR_BAD_UNICODE);
+                        return JBIN_NONE;
+                    }
+                    src += 2;
+                    uint8_t la = HEX[src[0]], lb = HEX[src[1]];
+                    uint8_t lc = HEX[src[2]], ld = HEX[src[3]];
+                    if (UNLIKELY((la | lb | lc | ld) & 0x80)) {
+                        p->cur = src - 2;
+                        fail(p, JBIN_ERR_BAD_UNICODE);
+                        return JBIN_NONE;
+                    }
+                    uint32_t low = ((uint32_t)la << 12) | ((uint32_t)lb << 8)
+                                 | ((uint32_t)lc << 4) | ld;
+                    src += 4;
+                    if (UNLIKELY(low < 0xDC00 || low > 0xDFFF)) {
+                        p->cur = src - 6;
+                        fail(p, JBIN_ERR_BAD_UNICODE);
+                        return JBIN_NONE;
+                    }
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                } else if (UNLIKELY(cp >= 0xDC00 && cp <= 0xDFFF)) {
+                    p->cur = src - 6;
+                    fail(p, JBIN_ERR_BAD_UNICODE);
+                    return JBIN_NONE;
+                }
+                if (UNLIKELY((uint32_t)(dst - dst_base) + 4 > capacity)) {
+                    p->cur = src;
+                    fail(p, JBIN_ERR_STRING_FULL);
+                    return JBIN_NONE;
+                }
+                if (cp <= 0x7F) {
+                    *dst++ = (uint8_t)cp;
+                } else if (cp <= 0x7FF) {
+                    *dst++ = (uint8_t)(0xC0 | (cp >> 6));
+                    *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+                } else if (cp <= 0xFFFF) {
+                    *dst++ = (uint8_t)(0xE0 | (cp >> 12));
+                    *dst++ = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                    *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+                } else {
+                    *dst++ = (uint8_t)(0xF0 | (cp >> 18));
+                    *dst++ = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
+                    *dst++ = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                    *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+                }
+        } else {
+            p->cur = src - 2;
+            fail(p, JBIN_ERR_BAD_ESCAPE);
+            return JBIN_NONE;
+        }
+    }
+
+    while (src < end) {
+        if (UNLIKELY((uint32_t)(dst - dst_base) >= capacity)) {
+            p->cur = src;
+            fail(p, JBIN_ERR_STRING_FULL);
+            return JBIN_NONE;
+        }
+
+        uint8_t ch = *src;
+
+        if (ch == '"') {
+            uint32_t slen = (uint32_t)(dst - dst_base);
+            p->arena->string_used = arena_start + slen;
+            if (UNLIKELY(has_non_ascii && !validate_utf8(dst_base, slen))) {
+                p->cur = src;
+                fail(p, JBIN_ERR_BAD_UTF8);
+                return JBIN_NONE;
+            }
+            p->arena->nodes[node].str_off = arena_start;
+            p->arena->nodes[node].str_len = slen;
+            p->cur = src + 1;
+            return node;
+        }
+
+        if (UNLIKELY(ch < 0x20)) {
+            p->cur = src;
+            fail(p, JBIN_ERR_CONTROL_CHAR);
+            return JBIN_NONE;
+        }
+
+        if (ch == '\\') {
+            if (UNLIKELY(src + 1 >= end)) {
+                p->cur = src;
+                fail(p, JBIN_ERR_UNTERMINATED_STRING);
+                return JBIN_NONE;
+            }
+            uint8_t esc_ch = src[1];
+            src += 2;
+            uint8_t rep = ESC[esc_ch];
+            if (LIKELY(rep)) {
+                *dst++ = rep;
+            } else if (LIKELY(esc_ch == 'u')) {
+                if (UNLIKELY(src + 4 > end)) {
+                    p->cur = src - 2;
+                    fail(p, JBIN_ERR_BAD_UNICODE);
+                    return JBIN_NONE;
+                }
+                uint8_t a = HEX[src[0]], b = HEX[src[1]];
+                uint8_t c = HEX[src[2]], d = HEX[src[3]];
+                if (UNLIKELY((a | b | c | d) & 0x80)) {
+                    p->cur = src - 2;
+                    fail(p, JBIN_ERR_BAD_UNICODE);
+                    return JBIN_NONE;
+                }
+                uint32_t cp = ((uint32_t)a << 12) | ((uint32_t)b << 8)
+                            | ((uint32_t)c << 4) | d;
+                src += 4;
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                    if (UNLIKELY(src + 6 > end || src[0] != '\\' || src[1] != 'u')) {
+                        p->cur = src - 6;
+                        fail(p, JBIN_ERR_BAD_UNICODE);
+                        return JBIN_NONE;
+                    }
+                    src += 2;
+                    uint8_t la = HEX[src[0]], lb = HEX[src[1]];
+                    uint8_t lc = HEX[src[2]], ld = HEX[src[3]];
+                    if (UNLIKELY((la | lb | lc | ld) & 0x80)) {
+                        p->cur = src - 2;
+                        fail(p, JBIN_ERR_BAD_UNICODE);
+                        return JBIN_NONE;
+                    }
+                    uint32_t low = ((uint32_t)la << 12) | ((uint32_t)lb << 8)
+                                 | ((uint32_t)lc << 4) | ld;
+                    src += 4;
+                    if (UNLIKELY(low < 0xDC00 || low > 0xDFFF)) {
+                        p->cur = src - 6;
+                        fail(p, JBIN_ERR_BAD_UNICODE);
+                        return JBIN_NONE;
+                    }
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                } else if (UNLIKELY(cp >= 0xDC00 && cp <= 0xDFFF)) {
+                    p->cur = src - 6;
+                    fail(p, JBIN_ERR_BAD_UNICODE);
+                    return JBIN_NONE;
+                }
+                if (UNLIKELY((uint32_t)(dst - dst_base) + 4 > capacity)) {
+                    p->cur = src;
+                    fail(p, JBIN_ERR_STRING_FULL);
+                    return JBIN_NONE;
+                }
+                if (cp <= 0x7F) {
+                    *dst++ = (uint8_t)cp;
+                } else if (cp <= 0x7FF) {
+                    *dst++ = (uint8_t)(0xC0 | (cp >> 6));
+                    *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+                } else if (cp <= 0xFFFF) {
+                    *dst++ = (uint8_t)(0xE0 | (cp >> 12));
+                    *dst++ = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                    *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+                } else {
+                    *dst++ = (uint8_t)(0xF0 | (cp >> 18));
+                    *dst++ = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
+                    *dst++ = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                    *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+                }
+            } else {
+                p->cur = src - 2;
+                fail(p, JBIN_ERR_BAD_ESCAPE);
+                return JBIN_NONE;
             }
             continue;
         }
 
+        has_non_ascii |= (ch >> 7);
+        *dst++ = ch;
+        src++;
+    }
+
+    p->cur = src;
+    fail(p, JBIN_ERR_UNTERMINATED_STRING);
+    return JBIN_NONE;
+}
+#else
+NOINLINE uint32_t parse_string_fused(P *p) {
+    if (UNLIKELY(p->cur >= p->end || *p->cur != '"')) {
+        fail(p, JBIN_ERR_UNEXPECTED);
+        return JBIN_NONE;
+    }
+
+    const uint8_t *src = p->cur + 1;
+    const uint8_t *end = p->end;
+    uint32_t arena_start = p->arena->string_used;
+    uint8_t *dst_base = (uint8_t *)p->arena->strings + arena_start;
+    uint8_t *dst = dst_base;
+    uint8_t *dst_end = (uint8_t *)p->arena->strings + JBIN_MAX_STRING;
+
+    uint32_t node = alloc_node(p, JBIN_STRING);
+    if (UNLIKELY(node == JBIN_NONE)) return JBIN_NONE;
+
+    while (LIKELY(src < end)) {
+        uint8_t c = *src;
+
+        if (LIKELY(c >= 0x20 && c != '"' && c != '\\')) {
+            if (UNLIKELY(dst >= dst_end)) {
+                p->cur = src;
+                fail(p, JBIN_ERR_STRING_FULL);
+                return JBIN_NONE;
+            }
+            *dst++ = c;
+            src++;
+            continue;
+        }
+
+        if (c == '"') {
+            uint32_t slen = (uint32_t)(dst - dst_base);
+            p->arena->string_used = arena_start + slen;
+            if (UNLIKELY(!validate_utf8(dst_base, slen))) {
+                p->cur = src;
+                fail(p, JBIN_ERR_BAD_UTF8);
+                return JBIN_NONE;
+            }
+            p->arena->nodes[node].str_off = arena_start;
+            p->arena->nodes[node].str_len = slen;
+            p->cur = src + 1;
+            return node;
+        }
+
+        if (c == '\\') {
+            src++;
+            if (UNLIKELY(src >= end)) {
+                p->cur = src;
+                fail(p, JBIN_ERR_UNTERMINATED_STRING);
+                return JBIN_NONE;
+            }
+            uint8_t esc_ch = *src++;
+            uint8_t rep = ESC[esc_ch];
+            if (LIKELY(rep)) {
+                if (UNLIKELY(dst >= dst_end)) goto full;
+                *dst++ = rep;
+            } else if (LIKELY(esc_ch == 'u')) {
+                if (UNLIKELY(src + 4 > end)) {
+                    p->cur = src;
+                    fail(p, JBIN_ERR_BAD_UNICODE);
+                    return JBIN_NONE;
+                }
+                uint8_t a = HEX[src[0]], b = HEX[src[1]];
+                uint8_t hc = HEX[src[2]], d = HEX[src[3]];
+                if (UNLIKELY((a | b | hc | d) & 0x80)) {
+                    p->cur = src;
+                    fail(p, JBIN_ERR_BAD_UNICODE);
+                    return JBIN_NONE;
+                }
+                uint32_t cp = ((uint32_t)a << 12) | ((uint32_t)b << 8) | ((uint32_t)hc << 4) | d;
+                src += 4;
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                    if (UNLIKELY(src + 6 > end || src[0] != '\\' || src[1] != 'u')) {
+                        p->cur = src;
+                        fail(p, JBIN_ERR_BAD_UNICODE);
+                        return JBIN_NONE;
+                    }
+                    src += 2;
+                    uint8_t la = HEX[src[0]], lb = HEX[src[1]];
+                    uint8_t lc = HEX[src[2]], ld = HEX[src[3]];
+                    if (UNLIKELY((la | lb | lc | ld) & 0x80)) {
+                        p->cur = src;
+                        fail(p, JBIN_ERR_BAD_UNICODE);
+                        return JBIN_NONE;
+                    }
+                    uint32_t low = ((uint32_t)la << 12) | ((uint32_t)lb << 8) | ((uint32_t)lc << 4) | ld;
+                    src += 4;
+                    if (UNLIKELY(low < 0xDC00 || low > 0xDFFF)) {
+                        p->cur = src;
+                        fail(p, JBIN_ERR_BAD_UNICODE);
+                        return JBIN_NONE;
+                    }
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                } else if (UNLIKELY(cp >= 0xDC00 && cp <= 0xDFFF)) {
+                    p->cur = src;
+                    fail(p, JBIN_ERR_BAD_UNICODE);
+                    return JBIN_NONE;
+                }
+                if (cp <= 0x7F) {
+                    if (UNLIKELY(dst >= dst_end)) goto full;
+                    *dst++ = (uint8_t)cp;
+                } else if (cp <= 0x7FF) {
+                    if (UNLIKELY(dst + 2 > dst_end)) goto full;
+                    *dst++ = (uint8_t)(0xC0 | (cp >> 6));
+                    *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+                } else if (cp <= 0xFFFF) {
+                    if (UNLIKELY(dst + 3 > dst_end)) goto full;
+                    *dst++ = (uint8_t)(0xE0 | (cp >> 12));
+                    *dst++ = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                    *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+                } else {
+                    if (UNLIKELY(dst + 4 > dst_end)) goto full;
+                    *dst++ = (uint8_t)(0xF0 | (cp >> 18));
+                    *dst++ = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
+                    *dst++ = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                    *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+                }
+            } else {
+                p->cur = src - 1;
+                fail(p, JBIN_ERR_BAD_ESCAPE);
+                return JBIN_NONE;
+            }
+            continue;
+        }
+
+        p->cur = src;
         fail(p, JBIN_ERR_CONTROL_CHAR);
         return JBIN_NONE;
     }
+
+    p->cur = src;
+    fail(p, JBIN_ERR_UNTERMINATED_STRING);
+    return JBIN_NONE;
+
+full:
+    p->cur = src;
+    fail(p, JBIN_ERR_STRING_FULL);
+    return JBIN_NONE;
 }
+#endif
 
 static uint32_t parse_number(P *p) {
     const uint8_t *start = p->cur;
@@ -426,7 +844,8 @@ static uint32_t parse_number(P *p) {
             return JBIN_NONE;
         }
     } else {
-        do { p->cur++; } while (p->cur < p->end && (uint32_t)(*p->cur - '0') <= 9u);
+        p->cur++;
+        skip_digits(&p->cur, p->end);
     }
 
     if (p->cur < p->end && *p->cur == '.') {
@@ -435,7 +854,8 @@ static uint32_t parse_number(P *p) {
             fail(p, JBIN_ERR_BAD_NUMBER);
             return JBIN_NONE;
         }
-        do { p->cur++; } while (p->cur < p->end && (uint32_t)(*p->cur - '0') <= 9u);
+        p->cur++;
+        skip_digits(&p->cur, p->end);
     }
 
     if (p->cur < p->end && (*p->cur == 'e' || *p->cur == 'E')) {
@@ -489,7 +909,8 @@ FINLINE uint32_t parse_number_s2(P *p, const uint8_t *start,
             fail(p, JBIN_ERR_BAD_NUMBER);
             return JBIN_NONE;
         }
-        do { cur++; } while ((uint32_t)(*cur - '0') <= 9u);
+        cur++;
+        skip_digits_nobound(&cur);
     }
 
     if (*cur == 'e' || *cur == 'E') {
@@ -503,6 +924,12 @@ FINLINE uint32_t parse_number_s2(P *p, const uint8_t *start,
         do { cur++; } while ((uint32_t)(*cur - '0') <= 9u);
     }
 
+    if (UNLIKELY(*cur > 0x20 && *cur != ',' && *cur != ']' && *cur != '}')) {
+        p->cur = cur;
+        fail(p, JBIN_ERR_BAD_NUMBER);
+        return JBIN_NONE;
+    }
+
     if (UNLIKELY(nc >= JBIN_MAX_NODES)) {
         fail(p, JBIN_ERR_NODES_FULL);
         return JBIN_NONE;
@@ -511,7 +938,6 @@ FINLINE uint32_t parse_number_s2(P *p, const uint8_t *start,
     nodes[nc].type = JBIN_NUMBER;
     nodes[nc].str_off = (uint32_t)(start - p->input) | JBIN_INPUT_REF;
     nodes[nc].str_len = (uint32_t)(cur - start);
-    p->cur = cur;
 
     return nc;
 }
@@ -525,11 +951,11 @@ FINLINE uint32_t parse_string_fast(P *p) {
         __m256i v = _mm256_loadu_si256((const __m256i *)str_begin);
         uint32_t qm = (uint32_t)_mm256_movemask_epi8(
             _mm256_cmpeq_epi8(v, _mm256_set1_epi8('"')));
+        uint32_t bm = (uint32_t)_mm256_movemask_epi8(
+            _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\\')));
         if (LIKELY(qm)) {
             uint32_t qp = (uint32_t)__builtin_ctz(qm);
             uint32_t before = (1u << qp) - 1;
-            uint32_t bm = (uint32_t)_mm256_movemask_epi8(
-                _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\\')));
             uint32_t cm = (uint32_t)_mm256_movemask_epi8(
                 _mm256_cmpgt_epi8(
                     _mm256_set1_epi8((char)0xA0),
@@ -549,7 +975,10 @@ FINLINE uint32_t parse_string_fast(P *p) {
                 p->cur = str_begin + qp + 1;
                 return node;
             }
+            return parse_string_fused(p);
         }
+        if (bm)
+            return parse_string_fused(p);
     }
 #endif
 
@@ -570,7 +999,7 @@ FINLINE uint32_t parse_string_fast(P *p) {
         return node;
     }
 
-    return parse_string_escape(p);
+    return parse_string_fused(p);
 }
 
 typedef struct {
@@ -865,12 +1294,12 @@ do_value:
                 value = parse_number(p);
                 if (UNLIKELY(value == JBIN_NONE)) return JBIN_NONE;
                 nc = p->node_count;
-            }
-            if (UNLIKELY(p->cur < p->end
-                && *p->cur != ',' && *p->cur != '}' && *p->cur != ']'
-                && *p->cur != ' ' && *p->cur != '\n' && *p->cur != '\r' && *p->cur != '\t')) {
-                fail(p, JBIN_ERR_BAD_NUMBER);
-                return JBIN_NONE;
+                if (UNLIKELY(p->cur < p->end
+                    && *p->cur != ',' && *p->cur != '}' && *p->cur != ']'
+                    && *p->cur != ' ' && *p->cur != '\n' && *p->cur != '\r' && *p->cur != '\t')) {
+                    fail(p, JBIN_ERR_BAD_NUMBER);
+                    return JBIN_NONE;
+                }
             }
             p->last_pos = pos;
             goto have_value;

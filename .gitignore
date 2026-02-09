@@ -1,4 +1,5 @@
 bench
+bench-simdjson
 test_runner
 *.o
 *.gcda
