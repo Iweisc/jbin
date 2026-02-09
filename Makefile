@@ -1,0 +1,51 @@
+CC       ?= cc
+CFLAGS    = -Wall -Wextra -Wpedantic -std=c11 -O2
+BENCHFLAGS = -O3 -march=native -std=c11 -fno-stack-protector -fno-asynchronous-unwind-tables
+
+ARENA     = -DJBIN_MAX_NODES='(1<<24)' \
+            -DJBIN_MAX_STRING='(256u*1024u*1024u)' \
+            -DJBIN_MAX_STRUCTURAL='(1<<25)' \
+            -D_POSIX_C_SOURCE=199309L
+
+DATA      = data/canada.json data/twitter.json data/citm_catalog.json data/large.json
+
+all: test_runner
+
+test_runner: test_runner.c jbin.c jbin.h
+	$(CC) $(CFLAGS) -o $@ test_runner.c jbin.c
+
+bench: bench.c jbin.c jbin.h
+	$(CC) $(BENCHFLAGS) $(ARENA) -o $@ bench.c jbin.c
+
+bench-pgo: bench.c jbin.c jbin.h
+	$(CC) $(BENCHFLAGS) $(ARENA) -fprofile-generate -o bench bench.c jbin.c
+	@echo "Training PGO profile..."
+	@for i in 1 2 3 4 5; do ./bench data/twitter.json data/citm_catalog.json >/dev/null; done
+	@./bench data/canada.json data/large.json >/dev/null
+	$(CC) $(BENCHFLAGS) $(ARENA) -fprofile-use -flto -o bench bench.c jbin.c
+	@rm -f *.gcda
+	@echo "PGO build complete. Run: ./bench -n100"
+
+check: test_runner
+	./test_runner
+
+check-v: test_runner
+	./test_runner -v
+
+check-suite: test_runner | JSONTestSuite
+	./test_runner JSONTestSuite/test_parsing
+
+check-suite-v: test_runner | JSONTestSuite
+	./test_runner -v JSONTestSuite/test_parsing
+
+JSONTestSuite:
+	git clone --depth 1 https://github.com/nst/JSONTestSuite.git
+
+freestanding-check: jbin.c jbin.h
+	$(CC) -std=c11 -ffreestanding -c -o /dev/null jbin.c
+	@echo "freestanding compilation OK"
+
+clean:
+	rm -f test_runner bench bench_pgo_gen *.o *.gcda
+
+.PHONY: all check check-v check-suite check-suite-v freestanding-check clean bench-pgo

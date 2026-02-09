@@ -1,0 +1,11 @@
+bench
+test_runner
+*.o
+*.gcda
+*.gcno
+*.s
+gmon.out
+JSONTestSuite/
+data/large.json
+data/github_events_large.json
+data/numbers.json
