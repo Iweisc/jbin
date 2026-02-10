@@ -2,7 +2,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <cmath>
-#include "simdjson/simdjson.h"
+#include "rapidjson/document.h"
 
 static double now_sec() {
     struct timespec ts;
@@ -16,30 +16,30 @@ static int cmp_double(const void *a, const void *b) {
 }
 
 static void bench_file(const char *path, int iters, int warmup) {
-    simdjson::padded_string json;
-    auto err = simdjson::padded_string::load(path).get(json);
-    if (err) {
-        printf("%-25s LOAD ERROR\n", path);
+    FILE *f = fopen(path, "rb");
+    if (!f) { printf("%-25s LOAD ERROR\n", path); return; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = (char *)malloc((size_t)sz);
+    fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+
+    rapidjson::Document doc;
+    doc.Parse(buf, (size_t)sz);
+    if (doc.HasParseError()) {
+        printf("%-25s PARSE ERROR at %zu\n", path, doc.GetErrorOffset());
+        free(buf);
         return;
     }
 
-    simdjson::dom::parser parser;
-    auto doc = parser.parse(json);
-    if (doc.error()) {
-        printf("%-25s PARSE ERROR: %s\n", path, simdjson::error_message(doc.error()));
-        return;
-    }
-
-    for (int i = 0; i < warmup; i++) {
-        auto d = parser.parse(json);
-        (void)d;
-    }
+    for (int i = 0; i < warmup; i++)
+        doc.Parse(buf, (size_t)sz);
 
     double *samples = (double *)malloc((size_t)iters * sizeof(double));
     for (int i = 0; i < iters; i++) {
         double t0 = now_sec();
-        auto d = parser.parse(json);
-        (void)d;
+        doc.Parse(buf, (size_t)sz);
         double t1 = now_sec();
         samples[i] = t1 - t0;
     }
@@ -60,15 +60,15 @@ static void bench_file(const char *path, int iters, int warmup) {
     }
     double stddev = sqrt(var / iters);
 
-    double sz = (double)json.size();
-    double mb = sz / (1024.0 * 1024.0);
-    double gb = sz / (1024.0 * 1024.0 * 1024.0);
+    double mb = (double)sz / (1024.0 * 1024.0);
+    double gb = (double)sz / (1024.0 * 1024.0 * 1024.0);
     printf("%-25s %7.2f MB  %8.3f  %8.3f  %8.3f  %7.3f  %8.3f\n",
            path, mb,
            best * 1000.0, median * 1000.0, worst * 1000.0,
            stddev * 1000.0, gb / median);
 
     free(samples);
+    free(buf);
 }
 
 int main(int argc, char **argv) {
@@ -83,12 +83,7 @@ int main(int argc, char **argv) {
         argc--; argv++;
     }
 
-    auto haswell = simdjson::get_available_implementations()["haswell"];
-    if (haswell && haswell->supported_by_runtime_system())
-        simdjson::get_active_implementation() = haswell;
-
-    printf("simdjson DOM [%s] benchmark (%d iterations, %d warmup)\n",
-           simdjson::get_active_implementation()->name().data(), iters, warmup);
+    printf("rapidjson benchmark (%d iterations, %d warmup)\n", iters, warmup);
     printf("%-25s %9s  %8s  %8s  %8s  %7s  %8s\n",
            "file", "size", "min", "median", "max", "stddev", "GB/s");
     printf("----------------------------"

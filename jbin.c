@@ -41,9 +41,9 @@ FINLINE void skip_digits(const uint8_t **cur, const uint8_t *end) {
 
 FINLINE void skip_digits_nobound(const uint8_t **cur) {
 #ifdef JBIN_AVX2
+    const __m256i v2f = _mm256_set1_epi8(0x2F);
+    const __m256i v3a = _mm256_set1_epi8(0x3A);
     {
-        const __m256i v2f = _mm256_set1_epi8(0x2F);
-        const __m256i v3a = _mm256_set1_epi8(0x3A);
         __m256i v = _mm256_loadu_si256((const __m256i *)*cur);
         uint32_t mask = (uint32_t)_mm256_movemask_epi8(
             _mm256_and_si256(_mm256_cmpgt_epi8(v, v2f), _mm256_cmpgt_epi8(v3a, v)));
@@ -112,7 +112,7 @@ FINLINE uint32_t alloc_node(P *p, JbinType type) {
         return JBIN_NONE;
     }
     p->node_count = idx + 1;
-    p->arena->nodes[idx].type = type;
+    jbin_node_set(&p->arena->nodes[idx], type, JBIN_NONE);
     return idx;
 }
 
@@ -123,15 +123,19 @@ FINLINE void skip_ws(P *p) {
     if (LIKELY(cur < end && *cur > 0x20)) return;
 
 #ifdef JBIN_AVX2
+    const __m256i vspace = _mm256_set1_epi8(' ');
+    const __m256i vnewline = _mm256_set1_epi8('\n');
+    const __m256i vreturn = _mm256_set1_epi8('\r');
+    const __m256i vtab = _mm256_set1_epi8('\t');
     while (cur + 32 <= end) {
         __m256i v = _mm256_loadu_si256((const __m256i *)cur);
         __m256i ws = _mm256_or_si256(
             _mm256_or_si256(
-                _mm256_cmpeq_epi8(v, _mm256_set1_epi8(' ')),
-                _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\n'))),
+                _mm256_cmpeq_epi8(v, vspace),
+                _mm256_cmpeq_epi8(v, vnewline)),
             _mm256_or_si256(
-                _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\r')),
-                _mm256_cmpeq_epi8(v, _mm256_set1_epi8('\t'))));
+                _mm256_cmpeq_epi8(v, vreturn),
+                _mm256_cmpeq_epi8(v, vtab)));
         uint32_t mask = (uint32_t)_mm256_movemask_epi8(ws);
         if (mask != 0xFFFFFFFFu) {
             p->cur = cur + (uint32_t)__builtin_ctz(~mask);
@@ -491,6 +495,12 @@ NOINLINE uint32_t parse_string_fused(P *p) {
         uint8_t rep = ESC[esc_ch];
         if (LIKELY(rep)) {
             *dst++ = rep;
+            while (src + 1 < end && *src == '\\') {
+                uint8_t nr = ESC[src[1]];
+                if (!nr) break;
+                *dst++ = nr;
+                src += 2;
+            }
             continue;
         }
         if (LIKELY(esc_ch == 'u')) {
@@ -742,6 +752,13 @@ NOINLINE uint32_t parse_string_fused(P *p) {
             if (LIKELY(rep)) {
                 if (UNLIKELY(dst >= dst_end)) goto full;
                 *dst++ = rep;
+                while (src < end && *src == '\\' && src + 1 < end) {
+                    uint8_t nr = ESC[src[1]];
+                    if (!nr) break;
+                    if (UNLIKELY(dst >= dst_end)) goto full;
+                    *dst++ = nr;
+                    src += 2;
+                }
             } else if (LIKELY(esc_ch == 'u')) {
                 if (UNLIKELY(src + 4 > end)) {
                     p->cur = src;
@@ -899,7 +916,8 @@ FINLINE uint32_t parse_number_s2(P *p, const uint8_t *start,
             return JBIN_NONE;
         }
     } else {
-        do { cur++; } while ((uint32_t)(*cur - '0') <= 9u);
+        cur++;
+        skip_digits_nobound(&cur);
     }
 
     if (*cur == '.') {
@@ -935,7 +953,7 @@ FINLINE uint32_t parse_number_s2(P *p, const uint8_t *start,
         return JBIN_NONE;
     }
 
-    nodes[nc].type = JBIN_NUMBER;
+    jbin_node_set(&nodes[nc], JBIN_NUMBER, JBIN_NONE);
     nodes[nc].str_off = (uint32_t)(start - p->input) | JBIN_INPUT_REF;
     nodes[nc].str_len = (uint32_t)(cur - start);
 
@@ -979,6 +997,45 @@ FINLINE uint32_t parse_string_fast(P *p) {
         }
         if (bm)
             return parse_string_fused(p);
+        /* Try second 32-byte chunk for strings 33-64 bytes */
+        if (LIKELY(str_begin + 64 <= p->end)) {
+            __m256i v2 = _mm256_loadu_si256((const __m256i *)(str_begin + 32));
+            uint32_t qm2 = (uint32_t)_mm256_movemask_epi8(
+                _mm256_cmpeq_epi8(v2, _mm256_set1_epi8('"')));
+            uint32_t bm2 = (uint32_t)_mm256_movemask_epi8(
+                _mm256_cmpeq_epi8(v2, _mm256_set1_epi8('\\')));
+            if (LIKELY(qm2 && !bm2)) {
+                uint32_t qp2 = (uint32_t)__builtin_ctz(qm2);
+                uint32_t total_len = 32 + qp2;
+                uint32_t cm2 = (uint32_t)_mm256_movemask_epi8(
+                    _mm256_cmpgt_epi8(
+                        _mm256_set1_epi8((char)0xA0),
+                        _mm256_xor_si256(v2, _mm256_set1_epi8((char)0x80))));
+                uint32_t before2 = (1u << qp2) - 1;
+                if (LIKELY(!(cm2 & before2))) {
+                    uint32_t cm1 = (uint32_t)_mm256_movemask_epi8(
+                        _mm256_cmpgt_epi8(
+                            _mm256_set1_epi8((char)0xA0),
+                            _mm256_xor_si256(v, _mm256_set1_epi8((char)0x80))));
+                    if (UNLIKELY(cm1)) return parse_string_fused(p);
+                    uint32_t hi1 = (uint32_t)_mm256_movemask_epi8(v);
+                    uint32_t hi2 = (uint32_t)_mm256_movemask_epi8(v2);
+                    if (UNLIKELY((hi1 | (hi2 & before2)))) {
+                        if (!validate_utf8(str_begin, total_len)) {
+                            fail(p, JBIN_ERR_BAD_UTF8);
+                            return JBIN_NONE;
+                        }
+                    }
+                    uint32_t node = alloc_node(p, JBIN_STRING);
+                    if (UNLIKELY(node == JBIN_NONE)) return JBIN_NONE;
+                    p->arena->nodes[node].str_off = (uint32_t)(str_begin - p->input) | JBIN_INPUT_REF;
+                    p->arena->nodes[node].str_len = total_len;
+                    p->cur = str_begin + total_len + 1;
+                    return node;
+                }
+            }
+            if (bm2) return parse_string_fused(p);
+        }
     }
 #endif
 
@@ -1008,6 +1065,9 @@ typedef struct {
     uint32_t  key;
     uint8_t   is_obj;
 } Frame;
+
+#define LINK_SET(lnk, val) \
+    (*(lnk) = (*(lnk) & ~JBIN_NEXT_MASK) | (val))
 
 #ifdef JBIN_TWOPASS
 
@@ -1091,14 +1151,16 @@ FINLINE int si_has(const SiIter *it) {
 
 FINLINE void si_advance(SiIter *it) {
     uint64_t m = _blsr_u64(it->mask);
-    it->mask = m;
-    if (UNLIKELY(!m)) {
-        while (it->bm_cur + 1 < it->bm_end) {
-            it->bm_cur++;
-            it->block_base += 64;
-            m = *it->bm_cur;
-            if (m) { it->mask = m; return; }
-        }
+    if (LIKELY(m)) {
+        it->mask = m;
+        return;
+    }
+    it->mask = 0;
+    while (it->bm_cur + 1 < it->bm_end) {
+        it->bm_cur++;
+        it->block_base += 64;
+        m = *it->bm_cur;
+        if (m) { it->mask = m; return; }
     }
 }
 
@@ -1258,6 +1320,11 @@ do_value:
         p->error_pos = p->last_pos;
         return JBIN_NONE;
     }
+    if (UNLIKELY(nc + 3 >= JBIN_MAX_NODES)) {
+        p->error = JBIN_ERR_NODES_FULL;
+        p->error_pos = p->last_pos;
+        return JBIN_NONE;
+    }
     {
         uint32_t pos = si_pos(&it);
         si_advance(&it);
@@ -1268,9 +1335,8 @@ do_value:
             si_advance(&it);
             uint32_t slen = close_pos - pos - 1;
             if (all_clean || LIKELY(!(dirty[pos >> 6] | dirty[close_pos >> 6]))) {
-                if (UNLIKELY(nc >= JBIN_MAX_NODES)) { fail(p, JBIN_ERR_NODES_FULL); return JBIN_NONE; }
                 value = nc++;
-                nodes[value].type = JBIN_STRING;
+                jbin_node_set(&nodes[value], JBIN_STRING, JBIN_NONE);
                 nodes[value].str_off = (pos + 1) | JBIN_INPUT_REF;
                 nodes[value].str_len = slen;
             } else {
@@ -1305,69 +1371,38 @@ do_value:
             goto have_value;
         }
         if (c == 't') {
-            p->cur = input + pos;
-            if (LIKELY(p->cur + 4 <= p->end
-                && p->cur[1] == 'r'
-                && p->cur[2] == 'u'
-                && p->cur[3] == 'e')) {
-                p->cur += 4;
-                if (UNLIKELY(p->cur < p->end
-                    && *p->cur != ',' && *p->cur != '}' && *p->cur != ']'
-                    && *p->cur != ' ' && *p->cur != '\n' && *p->cur != '\r' && *p->cur != '\t')) {
-                    fail(p, JBIN_ERR_BAD_LITERAL);
-                    return JBIN_NONE;
-                }
-                if (UNLIKELY(nc >= JBIN_MAX_NODES)) { fail(p, JBIN_ERR_NODES_FULL); return JBIN_NONE; }
+            uint32_t w; __builtin_memcpy(&w, input + pos, 4);
+            if (LIKELY(w == 0x65757274u)) {
                 value = nc++;
-                nodes[value].type = JBIN_TRUE;
+                jbin_node_set(&nodes[value], JBIN_TRUE, JBIN_NONE);
                 p->last_pos = pos;
                 goto have_value;
             }
+            p->cur = input + pos;
             fail(p, JBIN_ERR_BAD_LITERAL);
             return JBIN_NONE;
         }
         if (c == 'f') {
-            p->cur = input + pos;
-            if (LIKELY(p->cur + 5 <= p->end
-                && p->cur[1] == 'a'
-                && p->cur[2] == 'l'
-                && p->cur[3] == 's'
-                && p->cur[4] == 'e')) {
-                p->cur += 5;
-                if (UNLIKELY(p->cur < p->end
-                    && *p->cur != ',' && *p->cur != '}' && *p->cur != ']'
-                    && *p->cur != ' ' && *p->cur != '\n' && *p->cur != '\r' && *p->cur != '\t')) {
-                    fail(p, JBIN_ERR_BAD_LITERAL);
-                    return JBIN_NONE;
-                }
-                if (UNLIKELY(nc >= JBIN_MAX_NODES)) { fail(p, JBIN_ERR_NODES_FULL); return JBIN_NONE; }
+            uint32_t w; __builtin_memcpy(&w, input + pos + 1, 4);
+            if (LIKELY(w == 0x65736c61u)) {
                 value = nc++;
-                nodes[value].type = JBIN_FALSE;
+                jbin_node_set(&nodes[value], JBIN_FALSE, JBIN_NONE);
                 p->last_pos = pos;
                 goto have_value;
             }
+            p->cur = input + pos;
             fail(p, JBIN_ERR_BAD_LITERAL);
             return JBIN_NONE;
         }
         if (c == 'n') {
-            p->cur = input + pos;
-            if (LIKELY(p->cur + 4 <= p->end
-                && p->cur[1] == 'u'
-                && p->cur[2] == 'l'
-                && p->cur[3] == 'l')) {
-                p->cur += 4;
-                if (UNLIKELY(p->cur < p->end
-                    && *p->cur != ',' && *p->cur != '}' && *p->cur != ']'
-                    && *p->cur != ' ' && *p->cur != '\n' && *p->cur != '\r' && *p->cur != '\t')) {
-                    fail(p, JBIN_ERR_BAD_LITERAL);
-                    return JBIN_NONE;
-                }
-                if (UNLIKELY(nc >= JBIN_MAX_NODES)) { fail(p, JBIN_ERR_NODES_FULL); return JBIN_NONE; }
+            uint32_t w; __builtin_memcpy(&w, input + pos, 4);
+            if (LIKELY(w == 0x6c6c756eu)) {
                 value = nc++;
-                nodes[value].type = JBIN_NULL;
+                jbin_node_set(&nodes[value], JBIN_NULL, JBIN_NONE);
                 p->last_pos = pos;
                 goto have_value;
             }
+            p->cur = input + pos;
             fail(p, JBIN_ERR_BAD_LITERAL);
             return JBIN_NONE;
         }
@@ -1378,9 +1413,8 @@ do_value:
                 fail(p, JBIN_ERR_DEPTH);
                 return JBIN_NONE;
             }
-            if (UNLIKELY(nc >= JBIN_MAX_NODES)) { fail(p, JBIN_ERR_NODES_FULL); return JBIN_NONE; }
             value = nc++;
-            nodes[value].type = JBIN_ARRAY;
+            jbin_node_set(&nodes[value], JBIN_ARRAY, JBIN_NONE);
             nodes[value].first_child = JBIN_NONE;
             if (UNLIKELY(!si_has(&it))) {
                 p->error = JBIN_ERR_UNEXPECTED;
@@ -1408,9 +1442,8 @@ do_value:
                 fail(p, JBIN_ERR_DEPTH);
                 return JBIN_NONE;
             }
-            if (UNLIKELY(nc >= JBIN_MAX_NODES)) { fail(p, JBIN_ERR_NODES_FULL); return JBIN_NONE; }
             uint32_t obj = nc++;
-            nodes[obj].type = JBIN_OBJECT;
+            jbin_node_set(&nodes[obj], JBIN_OBJECT, JBIN_NONE);
             nodes[obj].first_child = JBIN_NONE;
             if (UNLIKELY(!si_has(&it))) {
                 p->error = JBIN_ERR_UNEXPECTED;
@@ -1436,9 +1469,8 @@ do_value:
                 si_advance(&it);
                 uint32_t klen = kclose - npos - 1;
                 if (all_clean || LIKELY(!(dirty[npos >> 6] | dirty[kclose >> 6]))) {
-                    if (UNLIKELY(nc >= JBIN_MAX_NODES)) { fail(p, JBIN_ERR_NODES_FULL); return JBIN_NONE; }
                     key = nc++;
-                    nodes[key].type = JBIN_STRING;
+                    jbin_node_set(&nodes[key], JBIN_STRING, JBIN_NONE);
                     nodes[key].str_off = (npos + 1) | JBIN_INPUT_REF;
                     nodes[key].str_len = klen;
                 } else {
@@ -1483,16 +1515,16 @@ have_value:
             p->error_pos = si_pos(&it);
             return JBIN_NONE;
         }
-        nodes[value].next = JBIN_NONE;
+        jbin_node_set(&nodes[value], jbin_node_type(&nodes[value]), JBIN_NONE);
         p->node_count = nc;
         return value;
     }
 
     if (stack[sp].is_obj) {
         uint32_t key = stack[sp].key;
-        nodes[key].next = value;
-        *stack[sp].link = key;
-        stack[sp].link = &nodes[value].next;
+        jbin_node_set(&nodes[key], jbin_node_type(&nodes[key]), value);
+        LINK_SET(stack[sp].link, key);
+        stack[sp].link = &nodes[value].type_next;
 
         if (UNLIKELY(!si_has(&it))) {
             p->error = JBIN_ERR_UNEXPECTED;
@@ -1505,7 +1537,7 @@ have_value:
             uint8_t c = input[pos];
             if (c == '}') {
                 p->last_pos = pos;
-                *stack[sp].link = JBIN_NONE;
+                LINK_SET(stack[sp].link, JBIN_NONE);
                 value = stack[sp].node;
                 sp--;
                 goto have_value;
@@ -1534,9 +1566,8 @@ have_value:
             si_advance(&it);
             uint32_t klen = kclose - npos - 1;
             if (all_clean || LIKELY(!(dirty[npos >> 6] | dirty[kclose >> 6]))) {
-                if (UNLIKELY(nc >= JBIN_MAX_NODES)) { fail(p, JBIN_ERR_NODES_FULL); return JBIN_NONE; }
                 key = nc++;
-                nodes[key].type = JBIN_STRING;
+                jbin_node_set(&nodes[key], JBIN_STRING, JBIN_NONE);
                 nodes[key].str_off = (npos + 1) | JBIN_INPUT_REF;
                 nodes[key].str_len = klen;
             } else {
@@ -1567,8 +1598,8 @@ have_value:
         goto do_value;
     }
 
-    *stack[sp].link = value;
-    stack[sp].link = &nodes[value].next;
+    LINK_SET(stack[sp].link, value);
+    stack[sp].link = &nodes[value].type_next;
 
     if (UNLIKELY(!si_has(&it))) {
         p->error = JBIN_ERR_UNEXPECTED;
@@ -1581,7 +1612,7 @@ have_value:
         uint8_t c = input[pos];
         if (c == ']') {
             p->last_pos = pos;
-            *stack[sp].link = JBIN_NONE;
+            LINK_SET(stack[sp].link, JBIN_NONE);
             value = stack[sp].node;
             sp--;
             goto have_value;
@@ -1632,10 +1663,8 @@ do_value:
         goto have_value;
     }
     if (c == 't') {
-        if (LIKELY(p->cur + 4 <= p->end
-            && p->cur[1] == 'r'
-            && p->cur[2] == 'u'
-            && p->cur[3] == 'e')) {
+        uint32_t w; __builtin_memcpy(&w, p->cur, 4);
+        if (LIKELY(p->cur + 4 <= p->end && w == 0x65757274u)) {
             p->cur += 4;
             value = alloc_node(p, JBIN_TRUE);
             if (UNLIKELY(value == JBIN_NONE)) return JBIN_NONE;
@@ -1645,11 +1674,8 @@ do_value:
         return JBIN_NONE;
     }
     if (c == 'f') {
-        if (LIKELY(p->cur + 5 <= p->end
-            && p->cur[1] == 'a'
-            && p->cur[2] == 'l'
-            && p->cur[3] == 's'
-            && p->cur[4] == 'e')) {
+        uint32_t w; __builtin_memcpy(&w, p->cur + 1, 4);
+        if (LIKELY(p->cur + 5 <= p->end && w == 0x65736c61u)) {
             p->cur += 5;
             value = alloc_node(p, JBIN_FALSE);
             if (UNLIKELY(value == JBIN_NONE)) return JBIN_NONE;
@@ -1659,10 +1685,8 @@ do_value:
         return JBIN_NONE;
     }
     if (c == 'n') {
-        if (LIKELY(p->cur + 4 <= p->end
-            && p->cur[1] == 'u'
-            && p->cur[2] == 'l'
-            && p->cur[3] == 'l')) {
+        uint32_t w; __builtin_memcpy(&w, p->cur, 4);
+        if (LIKELY(p->cur + 4 <= p->end && w == 0x6c6c756eu)) {
             p->cur += 4;
             value = alloc_node(p, JBIN_NULL);
             if (UNLIKELY(value == JBIN_NONE)) return JBIN_NONE;
@@ -1736,15 +1760,15 @@ do_value:
 
 have_value:
     if (sp < 0) {
-        nodes[value].next = JBIN_NONE;
+        jbin_node_set(&nodes[value], jbin_node_type(&nodes[value]), JBIN_NONE);
         return value;
     }
 
     if (stack[sp].is_obj) {
         uint32_t key = stack[sp].key;
-        nodes[key].next = value;
-        *stack[sp].link = key;
-        stack[sp].link = &nodes[value].next;
+        jbin_node_set(&nodes[key], jbin_node_type(&nodes[key]), value);
+        LINK_SET(stack[sp].link, key);
+        stack[sp].link = &nodes[value].type_next;
 
         skip_ws(p);
         if (UNLIKELY(p->cur >= p->end)) {
@@ -1755,7 +1779,7 @@ have_value:
         if (c == '}') {
             p->cur++;
             depth--;
-            *stack[sp].link = JBIN_NONE;
+            LINK_SET(stack[sp].link, JBIN_NONE);
             value = stack[sp].node;
             sp--;
             goto have_value;
@@ -1783,8 +1807,8 @@ have_value:
         goto do_value;
     }
 
-    *stack[sp].link = value;
-    stack[sp].link = &nodes[value].next;
+    LINK_SET(stack[sp].link, value);
+    stack[sp].link = &nodes[value].type_next;
 
     skip_ws(p);
     if (UNLIKELY(p->cur >= p->end)) {
@@ -1795,7 +1819,7 @@ have_value:
     if (c == ']') {
         p->cur++;
         depth--;
-        *stack[sp].link = JBIN_NONE;
+        LINK_SET(stack[sp].link, JBIN_NONE);
         value = stack[sp].node;
         sp--;
         goto have_value;

@@ -19,7 +19,7 @@
 #define JBIN_MAX_STRUCTURAL (JBIN_MAX_NODES * 2)
 #endif
 
-#define JBIN_NONE      ((uint32_t)0xFFFFFFFF)
+#define JBIN_NONE      ((uint32_t)0x1FFFFFFF)
 #define JBIN_INPUT_REF ((uint32_t)0x80000000)
 
 typedef enum {
@@ -52,7 +52,6 @@ typedef enum {
 } JbinError;
 
 typedef struct {
-    JbinType type;
     union {
         uint32_t first_child;
         struct {
@@ -60,8 +59,21 @@ typedef struct {
             uint32_t str_len;
         };
     };
-    uint32_t next;
+    uint32_t type_next;  /* bits 31-29 = type, bits 28-0 = next */
 } JbinNode;
+
+#define JBIN_TYPE_SHIFT 29
+#define JBIN_NEXT_MASK  ((uint32_t)0x1FFFFFFFu)
+
+static inline JbinType jbin_node_type(const JbinNode *n) {
+    return (JbinType)(n->type_next >> JBIN_TYPE_SHIFT);
+}
+static inline uint32_t jbin_node_next(const JbinNode *n) {
+    return n->type_next & JBIN_NEXT_MASK;
+}
+static inline void jbin_node_set(JbinNode *n, JbinType type, uint32_t next) {
+    n->type_next = ((uint32_t)type << JBIN_TYPE_SHIFT) | (next & JBIN_NEXT_MASK);
+}
 
 typedef struct {
     JbinNode nodes[JBIN_MAX_NODES];
