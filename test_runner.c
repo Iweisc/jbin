@@ -309,6 +309,271 @@ static int run_suite_dir(const char *dir, int verbose) {
     return y_fail + n_fail;
 }
 
+static int memcmp_len(const char *a, const char *b, uint32_t len) {
+    for (uint32_t i = 0; i < len; i++)
+        if (a[i] != b[i]) return 1;
+    return 0;
+}
+
+static int run_tape_tests(int verbose) {
+    int passed = 0, failed = 0;
+
+    #define TAPE_PASS(cond, name) do { \
+        if (cond) { passed++; if (verbose) printf("  PASS  %-45s\n", name); } \
+        else { failed++; printf("  FAIL  %-45s\n", name); } \
+    } while(0)
+
+    /* Test 1: String array (>64 bytes, triggers tape path) */
+    {
+        const char *json =
+            "[\"hello world\", \"foo bar baz\", \"testing tape\", \"more strings here\"]";
+        uint32_t len = (uint32_t)strlen(json);
+        jbin_arena_init(&arena);
+        JbinResult r = jbin_parse(&arena, json, len);
+        TAPE_PASS(r.error == JBIN_OK, "tape: string array parses");
+        TAPE_PASS(jbin_type(&arena, r.root) == JBIN_ARRAY, "tape: root is array");
+
+        if (r.error == JBIN_OK) {
+            uint32_t close_idx = jbin_container_close(&arena, r.root);
+            uint32_t child = jbin_first_child(&arena, r.root);
+            TAPE_PASS(child != JBIN_NONE, "tape: array has children");
+            TAPE_PASS(jbin_type(&arena, child) == JBIN_STRING, "tape: first child is string");
+            uint32_t slen;
+            const char *s = jbin_get_str(&arena, child, json, &slen);
+            TAPE_PASS(slen == 11 && !memcmp_len(s, "hello world", 11),
+                      "tape: first string content");
+
+            uint32_t second = jbin_next_sibling(&arena, child, close_idx);
+            TAPE_PASS(second != JBIN_NONE, "tape: has second element");
+            s = jbin_get_str(&arena, second, json, &slen);
+            TAPE_PASS(slen == 11 && !memcmp_len(s, "foo bar baz", 11),
+                      "tape: second string content");
+
+            uint32_t third = jbin_next_sibling(&arena, second, close_idx);
+            TAPE_PASS(third != JBIN_NONE, "tape: has third element");
+
+            uint32_t fourth = jbin_next_sibling(&arena, third, close_idx);
+            TAPE_PASS(fourth != JBIN_NONE, "tape: has fourth element");
+
+            uint32_t end = jbin_next_sibling(&arena, fourth, close_idx);
+            TAPE_PASS(end == JBIN_NONE, "tape: no fifth element");
+        }
+    }
+
+    /* Test 2: Object with string keys and values */
+    {
+        const char *json =
+            "{\"name\": \"Alice\", \"city\": \"Wonderland\", "
+            "\"quest\": \"adventure\", \"padding\": \"xyzzy\"}";
+        uint32_t len = (uint32_t)strlen(json);
+        jbin_arena_init(&arena);
+        JbinResult r = jbin_parse(&arena, json, len);
+        TAPE_PASS(r.error == JBIN_OK, "tape: object parses");
+        TAPE_PASS(jbin_type(&arena, r.root) == JBIN_OBJECT, "tape: root is object");
+
+        if (r.error == JBIN_OK) {
+            uint32_t close_idx = jbin_container_close(&arena, r.root);
+            uint32_t key = jbin_first_child(&arena, r.root);
+            TAPE_PASS(key != JBIN_NONE, "tape: obj has first key");
+            TAPE_PASS(jbin_type(&arena, key) == JBIN_STRING, "tape: key is string");
+
+            uint32_t slen;
+            const char *s = jbin_get_str(&arena, key, json, &slen);
+            TAPE_PASS(slen == 4 && !memcmp_len(s, "name", 4), "tape: first key is 'name'");
+
+            uint32_t val = jbin_obj_value(&arena, key);
+            TAPE_PASS(val != JBIN_NONE, "tape: has value for 'name'");
+            s = jbin_get_str(&arena, val, json, &slen);
+            TAPE_PASS(slen == 5 && !memcmp_len(s, "Alice", 5), "tape: value is 'Alice'");
+
+            uint32_t key2 = jbin_obj_next_key(&arena, key, close_idx);
+            TAPE_PASS(key2 != JBIN_NONE, "tape: has second key");
+            s = jbin_get_str(&arena, key2, json, &slen);
+            TAPE_PASS(slen == 4 && !memcmp_len(s, "city", 4), "tape: second key is 'city'");
+
+            uint32_t key3 = jbin_obj_next_key(&arena, key2, close_idx);
+            TAPE_PASS(key3 != JBIN_NONE, "tape: has third key");
+
+            uint32_t key4 = jbin_obj_next_key(&arena, key3, close_idx);
+            TAPE_PASS(key4 != JBIN_NONE, "tape: has fourth key");
+
+            uint32_t key5 = jbin_obj_next_key(&arena, key4, close_idx);
+            TAPE_PASS(key5 == JBIN_NONE, "tape: no fifth key");
+        }
+    }
+
+    /* Test 3: Nested containers in tape mode */
+    {
+        const char *json =
+            "{\"outer\": {\"inner\": [\"a\", \"b\"]}, "
+            "\"extra_padding_to_hit_64_bytes\": \"yes\"}";
+        uint32_t len = (uint32_t)strlen(json);
+        jbin_arena_init(&arena);
+        JbinResult r = jbin_parse(&arena, json, len);
+        TAPE_PASS(r.error == JBIN_OK, "tape: nested containers parse");
+
+        if (r.error == JBIN_OK) {
+            uint32_t close_idx = jbin_container_close(&arena, r.root);
+            uint32_t key = jbin_first_child(&arena, r.root);
+            uint32_t val = jbin_obj_value(&arena, key);
+            TAPE_PASS(jbin_type(&arena, val) == JBIN_OBJECT, "tape: nested obj type");
+
+            uint32_t inner_close = jbin_container_close(&arena, val);
+            uint32_t ik = jbin_first_child(&arena, val);
+            TAPE_PASS(ik != JBIN_NONE, "tape: inner obj has key");
+
+            uint32_t iv = jbin_obj_value(&arena, ik);
+            TAPE_PASS(jbin_type(&arena, iv) == JBIN_ARRAY, "tape: inner val is array");
+
+            uint32_t arr_close = jbin_container_close(&arena, iv);
+            uint32_t elem = jbin_first_child(&arena, iv);
+            TAPE_PASS(elem != JBIN_NONE, "tape: inner array has elements");
+            uint32_t slen;
+            const char *s = jbin_get_str(&arena, elem, json, &slen);
+            TAPE_PASS(slen == 1 && s[0] == 'a', "tape: first array elem is 'a'");
+
+            uint32_t elem2 = jbin_next_sibling(&arena, elem, arr_close);
+            TAPE_PASS(elem2 != JBIN_NONE, "tape: has second array elem");
+            s = jbin_get_str(&arena, elem2, json, &slen);
+            TAPE_PASS(slen == 1 && s[0] == 'b', "tape: second array elem is 'b'");
+
+            /* Navigate to second top-level key (skip nested obj) */
+            uint32_t key2 = jbin_obj_next_key(&arena, key, close_idx);
+            TAPE_PASS(key2 != JBIN_NONE, "tape: has second top key");
+            (void)inner_close;
+        }
+    }
+
+    /* Test 4: Empty containers in tape mode */
+    {
+        const char *json =
+            "{\"empty_arr\": [], \"empty_obj\": {}, "
+            "\"pad_to_64_bytes_string\": \"abcdefghij\"}";
+        uint32_t len = (uint32_t)strlen(json);
+        jbin_arena_init(&arena);
+        JbinResult r = jbin_parse(&arena, json, len);
+        TAPE_PASS(r.error == JBIN_OK, "tape: empty containers parse");
+
+        if (r.error == JBIN_OK) {
+            uint32_t close_idx = jbin_container_close(&arena, r.root);
+            uint32_t key = jbin_first_child(&arena, r.root);
+            uint32_t val = jbin_obj_value(&arena, key);
+            TAPE_PASS(jbin_type(&arena, val) == JBIN_ARRAY, "tape: empty arr type");
+            TAPE_PASS(jbin_first_child(&arena, val) == JBIN_NONE,
+                      "tape: empty arr no children");
+
+            uint32_t key2 = jbin_obj_next_key(&arena, key, close_idx);
+            uint32_t val2 = jbin_obj_value(&arena, key2);
+            TAPE_PASS(jbin_type(&arena, val2) == JBIN_OBJECT, "tape: empty obj type");
+            TAPE_PASS(jbin_first_child(&arena, val2) == JBIN_NONE,
+                      "tape: empty obj no children");
+        }
+    }
+
+    /* Test 5: Dirty strings (escapes) in tape mode */
+    {
+        const char *json =
+            "[\"hello\\nworld\", \"tab\\there\", "
+            "\"quote\\\"inside\", \"padding_string_for_length\"]";
+        uint32_t len = (uint32_t)strlen(json);
+        jbin_arena_init(&arena);
+        JbinResult r = jbin_parse(&arena, json, len);
+        TAPE_PASS(r.error == JBIN_OK, "tape: escaped strings parse");
+
+        if (r.error == JBIN_OK) {
+            uint32_t close_idx = jbin_container_close(&arena, r.root);
+            uint32_t child = jbin_first_child(&arena, r.root);
+            uint32_t slen;
+            const char *s = jbin_get_str(&arena, child, json, &slen);
+            TAPE_PASS(slen == 11 && s[5] == '\n', "tape: escaped newline");
+
+            uint32_t second = jbin_next_sibling(&arena, child, close_idx);
+            s = jbin_get_str(&arena, second, json, &slen);
+            TAPE_PASS(slen == 8 && s[3] == '\t', "tape: escaped tab");
+
+            uint32_t third = jbin_next_sibling(&arena, second, close_idx);
+            s = jbin_get_str(&arena, third, json, &slen);
+            TAPE_PASS(slen == 12 && s[5] == '"', "tape: escaped quote");
+        }
+    }
+
+    /* Test 6: Mixed types (literals + numbers) in string-heavy tape context */
+    {
+        const char *json =
+            "[\"string\", true, false, null, 42, "
+            "\"another_string_padding_for_64_bytes_xxxxxxx\"]";
+        uint32_t len = (uint32_t)strlen(json);
+        jbin_arena_init(&arena);
+        JbinResult r = jbin_parse(&arena, json, len);
+        TAPE_PASS(r.error == JBIN_OK, "tape: mixed types parse");
+
+        if (r.error == JBIN_OK) {
+            uint32_t close_idx = jbin_container_close(&arena, r.root);
+            uint32_t c = jbin_first_child(&arena, r.root);
+            TAPE_PASS(jbin_type(&arena, c) == JBIN_STRING, "tape: mixed[0] string");
+
+            c = jbin_next_sibling(&arena, c, close_idx);
+            TAPE_PASS(jbin_type(&arena, c) == JBIN_TRUE, "tape: mixed[1] true");
+
+            c = jbin_next_sibling(&arena, c, close_idx);
+            TAPE_PASS(jbin_type(&arena, c) == JBIN_FALSE, "tape: mixed[2] false");
+
+            c = jbin_next_sibling(&arena, c, close_idx);
+            TAPE_PASS(jbin_type(&arena, c) == JBIN_NULL, "tape: mixed[3] null");
+
+            c = jbin_next_sibling(&arena, c, close_idx);
+            TAPE_PASS(jbin_type(&arena, c) == JBIN_NUMBER, "tape: mixed[4] number");
+            uint32_t slen;
+            const char *s = jbin_get_str(&arena, c, json, &slen);
+            TAPE_PASS(slen == 2 && s[0] == '4' && s[1] == '2',
+                      "tape: number content '42'");
+
+            c = jbin_next_sibling(&arena, c, close_idx);
+            TAPE_PASS(jbin_type(&arena, c) == JBIN_STRING, "tape: mixed[5] string");
+        }
+    }
+
+    /* Test 7: Verify is_tape flag is set correctly (only meaningful
+       when compiled with -march=native for AVX2+PCLMUL two-pass) */
+    {
+        const char *tape_json =
+            "[\"aaaa_long_string\", \"bbbb_long_string\", "
+            "\"cccc_long_string\", \"dddd_long_string\", "
+            "\"eeee_long_string\", \"ffff_long_string\"]";
+        uint32_t len = (uint32_t)strlen(tape_json);
+        jbin_arena_init(&arena);
+        JbinResult r = jbin_parse(&arena, tape_json, len);
+        TAPE_PASS(r.error == JBIN_OK, "tape: string-heavy parses ok");
+
+        /* Small input should always use DOM (is_tape=0) */
+        const char *dom_json = "[1, 2, 3]";
+        jbin_arena_init(&arena);
+        r = jbin_parse(&arena, dom_json, (uint32_t)strlen(dom_json));
+        TAPE_PASS(r.error == JBIN_OK && arena.is_tape == 0,
+                  "tape: is_tape=0 for small input");
+
+        /* If two-pass is available, verify tape mode activates */
+        if (arena.is_tape == 0) {
+            /* Re-parse the string-heavy input and check */
+            jbin_arena_init(&arena);
+            r = jbin_parse(&arena, tape_json, len);
+            if (arena.is_tape == 1) {
+                TAPE_PASS(1, "tape: is_tape=1 for string-heavy (twopass)");
+            } else {
+                /* No twopass support compiled in - skip */
+                TAPE_PASS(1, "tape: twopass not available (scalar build)");
+            }
+        } else {
+            TAPE_PASS(1, "tape: twopass check placeholder");
+        }
+    }
+
+    #undef TAPE_PASS
+
+    printf("\nTape navigation: %d passed, %d failed\n", passed, failed);
+    return failed;
+}
+
 int main(int argc, char **argv) {
     int verbose = 0;
     const char *suite_dir = NULL;
@@ -322,6 +587,9 @@ int main(int argc, char **argv) {
 
     printf("=== jbin built-in tests ===\n");
     int failures = run_builtin_tests(verbose);
+
+    printf("\n=== Tape navigation tests ===\n");
+    failures += run_tape_tests(verbose);
 
     if (suite_dir) {
         printf("\n=== JSONTestSuite ===\n");

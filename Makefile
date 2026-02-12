@@ -22,11 +22,28 @@ bench-pgo: bench.c jbin.c jbin.h
 	$(CC) $(BENCHFLAGS) $(ARENA) -fprofile-generate -o bench bench.c jbin.c -lm
 	@echo "Training PGO profile..."
 	@for i in 1 2 3 4 5; do ./bench data/twitter.json data/citm_catalog.json >/dev/null; done
-	@./bench data/canada.json data/large.json >/dev/null
-	@for i in 1 2 3; do ./bench data/numbers.json data/mesh.json >/dev/null 2>/dev/null || true; done
+	@./bench data/canada.json data/large.json >/dev/null 2>/dev/null || true
+	@for i in 1 2 3; do ./bench data/mesh.json >/dev/null 2>/dev/null || true; done
+	@for i in 1 2 3 4 5; do ./bench data/booleans.json data/truenull.json data/deep_nested.json >/dev/null; done
+	@for i in 1 2 3 4 5; do ./bench data/string_array.json data/escape_heavy.json >/dev/null; done
+	@for i in 1 2 3; do ./bench data/flat_kv.json data/instruments.json data/mixed_types.json >/dev/null; done
 	$(CC) $(BENCHFLAGS) $(ARENA) -fprofile-use -flto -o bench bench.c jbin.c -lm
 	@rm -f *.gcda
 	@echo "PGO build complete. Run: ./bench -n100"
+
+bench-pgo-clang: bench.c jbin.c jbin.h
+	clang $(BENCHFLAGS) $(ARENA) -fprofile-generate -o bench bench.c jbin.c -lm
+	@echo "Training PGO profile (clang)..."
+	@for i in 1 2 3 4 5; do ./bench data/twitter.json data/citm_catalog.json >/dev/null; done
+	@./bench data/canada.json data/large.json >/dev/null 2>/dev/null || true
+	@for i in 1 2 3; do ./bench data/mesh.json >/dev/null 2>/dev/null || true; done
+	@for i in 1 2 3 4 5; do ./bench data/booleans.json data/truenull.json data/deep_nested.json >/dev/null; done
+	@for i in 1 2 3 4 5; do ./bench data/string_array.json data/escape_heavy.json >/dev/null; done
+	@for i in 1 2 3; do ./bench data/flat_kv.json data/instruments.json data/mixed_types.json >/dev/null; done
+	llvm-profdata merge -output=bench.profdata default_*.profraw
+	clang $(BENCHFLAGS) $(ARENA) -fprofile-use=bench.profdata -flto -o bench bench.c jbin.c -lm
+	@rm -f *.profraw bench.profdata
+	@echo "PGO build complete (clang). Run: ./bench -n100"
 
 bench-simdjson: bench_simdjson.cpp simdjson/simdjson.h simdjson/simdjson.cpp
 	$(CXX) -O3 -march=native -o $@ bench_simdjson.cpp simdjson/simdjson.cpp
@@ -63,6 +80,6 @@ freestanding-check: jbin.c jbin.h
 	@echo "freestanding compilation OK"
 
 clean:
-	rm -f test_runner bench bench-simdjson bench-yyjson bench-rapidjson bench-cjson bench-sajson *.o *.gcda
+	rm -f test_runner bench bench-simdjson bench-yyjson bench-rapidjson bench-cjson bench-sajson *.o *.gcda *.profraw *.profdata
 
-.PHONY: all check check-v check-suite check-suite-v freestanding-check clean bench-pgo
+.PHONY: all check check-v check-suite check-suite-v freestanding-check clean bench-pgo bench-pgo-clang

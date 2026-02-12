@@ -1,12 +1,27 @@
 bench
 bench-simdjson
+bench-cjson
+bench-rapidjson
+bench-sajson
+bench-yyjson
+bench_clang
+bench_clang_pgo
+bench_debug
+bench_perf
 test_runner
 *.o
 *.gcda
 *.gcno
 *.s
+*.profraw
+*.baseline
+*.baseline_*
 gmon.out
 JSONTestSuite/
 data/large.json
 data/github_events_large.json
 data/numbers.json
+
+# Claude Code
+.claude/
+CLAUDE.md

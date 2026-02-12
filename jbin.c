@@ -1126,6 +1126,7 @@ typedef struct {
     const uint64_t *bm_cur;
     const uint64_t *bm_end;
     uint32_t block_base;
+    uint32_t cur_pos;
     uint64_t mask;
 } SiIter;
 
@@ -1139,10 +1140,11 @@ FINLINE void si_init(SiIter *it, const uint64_t *bm, uint32_t num_blocks) {
         it->block_base += 64;
         it->mask = *it->bm_cur;
     }
+    it->cur_pos = it->block_base + (uint32_t)__builtin_ctzll(it->mask);
 }
 
 FINLINE uint32_t si_pos(const SiIter *it) {
-    return it->block_base + (uint32_t)__builtin_ctzll(it->mask);
+    return it->cur_pos;
 }
 
 FINLINE int si_has(const SiIter *it) {
@@ -1153,6 +1155,7 @@ FINLINE void si_advance(SiIter *it) {
     uint64_t m = _blsr_u64(it->mask);
     if (LIKELY(m)) {
         it->mask = m;
+        it->cur_pos = it->block_base + (uint32_t)__builtin_ctzll(m);
         return;
     }
     it->mask = 0;
@@ -1160,8 +1163,34 @@ FINLINE void si_advance(SiIter *it) {
         it->bm_cur++;
         it->block_base += 64;
         m = *it->bm_cur;
-        if (m) { it->mask = m; return; }
+        if (m) {
+            it->mask = m;
+            it->cur_pos = it->block_base + (uint32_t)__builtin_ctzll(m);
+            return;
+        }
     }
+}
+
+FINLINE uint32_t si_next(SiIter *it) {
+    uint32_t p = it->cur_pos;
+    uint64_t m = _blsr_u64(it->mask);
+    if (LIKELY(m)) {
+        it->mask = m;
+        it->cur_pos = it->block_base + (uint32_t)__builtin_ctzll(m);
+        return p;
+    }
+    it->mask = 0;
+    while (it->bm_cur + 1 < it->bm_end) {
+        it->bm_cur++;
+        it->block_base += 64;
+        m = *it->bm_cur;
+        if (m) {
+            it->mask = m;
+            it->cur_pos = it->block_base + (uint32_t)__builtin_ctzll(m);
+            return p;
+        }
+    }
+    return p;
 }
 
 FINLINE void classify_block(const __m256i v,
@@ -1187,14 +1216,16 @@ FINLINE void classify_block(const __m256i v,
 
 static uint32_t stage1_bitmask(const uint8_t *input, uint32_t length,
                                 uint64_t *bm_out, uint32_t bm_cap,
-                                uint8_t *dirty_out) {
+                                uint8_t *dirty_out,
+                                uint8_t *any_dirty_out) {
     uint32_t num_blocks = 0;
+    uint8_t any_dirty_acc = 0;
     uint64_t prev_in_string = 0;
     uint64_t prev_odd_carry = 0;
     uint64_t prev_scalar = 0;
 
-    const __m256i v_bs   = _mm256_set1_epi8('\\');
-    const __m256i v_qt   = _mm256_set1_epi8('"');
+    const __m256i v_bs    = _mm256_set1_epi8('\\');
+    const __m256i v_qt    = _mm256_set1_epi8('"');
 
     const __m256i nib_mask = _mm256_set1_epi8(0x0F);
     const __m256i zeroes   = _mm256_setzero_si256();
@@ -1250,9 +1281,14 @@ static uint32_t stage1_bitmask(const uint8_t *input, uint32_t length,
         prev_scalar = is_scalar >> 63;
 
         uint64_t special_bits = (uint64_t)sp_lo | ((uint64_t)sp_hi << 32);
+        uint64_t non_ascii =
+            (uint32_t)_mm256_movemask_epi8(lo)
+            | ((uint64_t)(uint32_t)_mm256_movemask_epi8(hi) << 32);
+        uint64_t ctrl_bits = special_bits & ~non_ascii;
 
-        if (UNLIKELY(num_blocks >= bm_cap)) return num_blocks;
-        dirty_out[num_blocks] = ((bs_bits | special_bits) & in_string) != 0;
+        if (UNLIKELY(num_blocks >= bm_cap)) { *any_dirty_out = any_dirty_acc; return num_blocks; }
+        dirty_out[num_blocks] = ((bs_bits | ctrl_bits) & in_string) ? 1 : 0;
+        any_dirty_acc |= dirty_out[num_blocks];
         bm_out[num_blocks++] = structurals | real_quotes | scalar_starts;
     }
 
@@ -1293,12 +1329,18 @@ static uint32_t stage1_bitmask(const uint8_t *input, uint32_t length,
         uint64_t scalar_starts = is_scalar & ~((is_scalar << 1) | prev_scalar);
 
         uint64_t special_bits = (uint64_t)sp_lo | ((uint64_t)sp_hi << 32);
+        uint64_t non_ascii =
+            (uint32_t)_mm256_movemask_epi8(lo)
+            | ((uint64_t)(uint32_t)_mm256_movemask_epi8(hi) << 32);
+        uint64_t ctrl_bits = special_bits & ~non_ascii;
 
-        if (UNLIKELY(num_blocks >= bm_cap)) return num_blocks;
-        dirty_out[num_blocks] = ((bs_bits | special_bits) & in_string) != 0;
+        if (UNLIKELY(num_blocks >= bm_cap)) { *any_dirty_out = any_dirty_acc; return num_blocks; }
+        dirty_out[num_blocks] = ((bs_bits | ctrl_bits) & in_string) ? 1 : 0;
+        any_dirty_acc |= dirty_out[num_blocks];
         bm_out[num_blocks++] = structurals | real_quotes | scalar_starts;
     }
 
+    *any_dirty_out = any_dirty_acc;
     return num_blocks;
 }
 
@@ -1313,6 +1355,8 @@ FINLINE uint32_t stage2_core(P *p, SiIter *itp, const uint8_t *dirty,
     SiIter it = *itp;
     p->last_pos = 0;
     uint32_t nc = p->node_count;
+    uint32_t pos;
+    uint8_t c;
 
 do_value:
     if (UNLIKELY(!si_has(&it))) {
@@ -1325,14 +1369,13 @@ do_value:
         p->error_pos = p->last_pos;
         return JBIN_NONE;
     }
+    pos = si_next(&it);
+    c = input[pos];
+do_dispatch: ;
     {
-        uint32_t pos = si_pos(&it);
-        si_advance(&it);
-        uint8_t c = input[pos];
 
         if (c == '"') {
-            uint32_t close_pos = si_pos(&it);
-            si_advance(&it);
+            uint32_t close_pos = si_next(&it);
             uint32_t slen = close_pos - pos - 1;
             if (all_clean || LIKELY(!(dirty[pos >> 6] | dirty[close_pos >> 6]))) {
                 value = nc++;
@@ -1452,8 +1495,7 @@ do_value:
             }
             uint32_t key;
             {
-                uint32_t npos = si_pos(&it);
-                si_advance(&it);
+                uint32_t npos = si_next(&it);
                 uint8_t fc = input[npos];
                 if (fc == '}') {
                     p->last_pos = npos;
@@ -1465,8 +1507,7 @@ do_value:
                     p->error_pos = npos;
                     return JBIN_NONE;
                 }
-                uint32_t kclose = si_pos(&it);
-                si_advance(&it);
+                uint32_t kclose = si_next(&it);
                 uint32_t klen = kclose - npos - 1;
                 if (all_clean || LIKELY(!(dirty[npos >> 6] | dirty[kclose >> 6]))) {
                     key = nc++;
@@ -1481,14 +1522,8 @@ do_value:
                     nc = p->node_count;
                 }
             }
-            if (UNLIKELY(!si_has(&it))) {
-                p->error = JBIN_ERR_EXPECTED_COLON;
-                p->error_pos = p->last_pos;
-                return JBIN_NONE;
-            }
             {
-                uint32_t cpos = si_pos(&it);
-                si_advance(&it);
+                uint32_t cpos = si_next(&it);
                 if (UNLIKELY(input[cpos] != ':')) {
                     p->error = JBIN_ERR_EXPECTED_COLON;
                     p->error_pos = cpos;
@@ -1532,38 +1567,29 @@ have_value:
             return JBIN_NONE;
         }
         {
-            uint32_t pos = si_pos(&it);
-            si_advance(&it);
-            uint8_t c = input[pos];
-            if (c == '}') {
-                p->last_pos = pos;
+            uint32_t npos = si_next(&it);
+            if (input[npos] == '}') {
+                p->last_pos = npos;
                 LINK_SET(stack[sp].link, JBIN_NONE);
                 value = stack[sp].node;
                 sp--;
                 goto have_value;
             }
-            if (UNLIKELY(c != ',')) {
+            if (UNLIKELY(input[npos] != ',')) {
                 p->error = JBIN_ERR_UNEXPECTED;
-                p->error_pos = pos;
+                p->error_pos = npos;
                 return JBIN_NONE;
             }
         }
 
         {
-            if (UNLIKELY(!si_has(&it))) {
-                p->error = JBIN_ERR_EXPECTED_KEY;
-                p->error_pos = p->last_pos;
-                return JBIN_NONE;
-            }
-            uint32_t npos = si_pos(&it);
-            si_advance(&it);
+            uint32_t npos = si_next(&it);
             if (UNLIKELY(input[npos] != '"')) {
                 p->error = JBIN_ERR_EXPECTED_KEY;
                 p->error_pos = npos;
                 return JBIN_NONE;
             }
-            uint32_t kclose = si_pos(&it);
-            si_advance(&it);
+            uint32_t kclose = si_next(&it);
             uint32_t klen = kclose - npos - 1;
             if (all_clean || LIKELY(!(dirty[npos >> 6] | dirty[kclose >> 6]))) {
                 key = nc++;
@@ -1579,14 +1605,8 @@ have_value:
             }
         }
 
-        if (UNLIKELY(!si_has(&it))) {
-            p->error = JBIN_ERR_EXPECTED_COLON;
-            p->error_pos = p->last_pos;
-            return JBIN_NONE;
-        }
         {
-            uint32_t cpos = si_pos(&it);
-            si_advance(&it);
+            uint32_t cpos = si_next(&it);
             if (UNLIKELY(input[cpos] != ':')) {
                 p->error = JBIN_ERR_EXPECTED_COLON;
                 p->error_pos = cpos;
@@ -1595,7 +1615,20 @@ have_value:
         }
 
         stack[sp].key = key;
-        goto do_value;
+        /* Fused: fetch next value structural without going through do_value */
+        if (UNLIKELY(!si_has(&it))) {
+            p->error = JBIN_ERR_UNEXPECTED;
+            p->error_pos = p->last_pos;
+            return JBIN_NONE;
+        }
+        if (UNLIKELY(nc + 3 >= JBIN_MAX_NODES)) {
+            p->error = JBIN_ERR_NODES_FULL;
+            p->error_pos = p->last_pos;
+            return JBIN_NONE;
+        }
+        pos = si_next(&it);
+        c = input[pos];
+        goto do_dispatch;
     }
 
     LINK_SET(stack[sp].link, value);
@@ -1607,23 +1640,34 @@ have_value:
         return JBIN_NONE;
     }
     {
-        uint32_t pos = si_pos(&it);
-        si_advance(&it);
-        uint8_t c = input[pos];
-        if (c == ']') {
-            p->last_pos = pos;
+        uint32_t npos = si_next(&it);
+        if (input[npos] == ']') {
+            p->last_pos = npos;
             LINK_SET(stack[sp].link, JBIN_NONE);
             value = stack[sp].node;
             sp--;
             goto have_value;
         }
-        if (UNLIKELY(c != ',')) {
+        if (UNLIKELY(input[npos] != ',')) {
             p->error = JBIN_ERR_UNEXPECTED;
-            p->error_pos = pos;
+            p->error_pos = npos;
             return JBIN_NONE;
         }
     }
-    goto do_value;
+    /* Fused: fetch next value structural without going through do_value */
+    if (UNLIKELY(!si_has(&it))) {
+        p->error = JBIN_ERR_UNEXPECTED;
+        p->error_pos = p->last_pos;
+        return JBIN_NONE;
+    }
+    if (UNLIKELY(nc + 3 >= JBIN_MAX_NODES)) {
+        p->error = JBIN_ERR_NODES_FULL;
+        p->error_pos = p->last_pos;
+        return JBIN_NONE;
+    }
+    pos = si_next(&it);
+    c = input[pos];
+    goto do_dispatch;
 }
 
 static uint32_t stage2_bitmask(P *p, SiIter *itp, const uint8_t *dirty) {
@@ -1634,7 +1678,1450 @@ static uint32_t stage2_clean(P *p, SiIter *itp) {
     return stage2_core(p, itp, NULL, 1);
 }
 
-#endif
+/* --- Tape-based stage2 (sequential writes, no tree construction) --- */
+
+typedef struct {
+    uint32_t open_idx;
+    uint8_t  is_obj;
+} TapeFrame;
+
+FINLINE int tape_str_dirty(const uint8_t *s, uint32_t len) {
+    const uint64_t LO = 0x0101010101010101ULL;
+    const uint64_t HI = 0x8080808080808080ULL;
+    const uint64_t BS = 0x5C5C5C5C5C5C5C5CULL;
+    const uint64_t SP = 0x2020202020202020ULL;
+    uint32_t i = 0;
+    for (; i + 8 <= len; i += 8) {
+        uint64_t v;
+        __builtin_memcpy(&v, s + i, 8);
+        /* backslash: haszero(v ^ 0x5C) */
+        uint64_t xbs = v ^ BS;
+        uint64_t has_bs = (xbs - LO) & ~xbs & HI;
+        /* control chars < 0x20, no false positives for >= 0x80 */
+        uint64_t has_ctrl = ~((v | HI) - SP) & ~v & HI;
+        if (has_bs | has_ctrl) return 1;
+    }
+    for (; i < len; i++) {
+        uint8_t c = s[i];
+        if (c == '\\' || c < 0x20)
+            return 1;
+    }
+    return 0;
+}
+
+/*
+ * Inline string handler for strings < 32 bytes in dirty blocks.
+ * Uses a single AVX2 load to detect backslashes, then:
+ *   - No backslash → zero-copy reference
+ *   - Simple escapes → copy+decode inline using bitmask-guided segments
+ *   - Unicode escapes → return 0 (fall back to tape_string_fused)
+ * Returns: 1 = handled, 0 = needs fused, -1 = error.
+ */
+FINLINE int tape_string_inline(P *p, const uint8_t *input,
+                                 uint64_t *tape, uint32_t *tc_p,
+                                 uint32_t pos, uint32_t slen,
+                                 __m256i vbs, __m256i vxor, __m256i vthresh) {
+    if (slen >= 32 || pos + 33 > (uint32_t)(p->end - p->input))
+        return 0;
+    const uint8_t *s = input + pos + 1;
+    __m256i v = _mm256_loadu_si256((const __m256i *)s);
+    uint32_t slen_mask = slen ? (1u << slen) - 1 : 0;
+    uint32_t bs = (uint32_t)_mm256_movemask_epi8(
+        _mm256_cmpeq_epi8(v, vbs)) & slen_mask;
+    uint32_t cm = (uint32_t)_mm256_movemask_epi8(
+        _mm256_cmpgt_epi8(vthresh, _mm256_xor_si256(v, vxor))) & slen_mask;
+    if (UNLIKELY(cm)) {
+        p->cur = s + (uint32_t)__builtin_ctz(cm);
+        fail(p, JBIN_ERR_CONTROL_CHAR);
+        return -1;
+    }
+    if (LIKELY(!bs)) {
+        /* No backslash → zero-copy */
+        uint32_t na = (uint32_t)_mm256_movemask_epi8(v) & slen_mask;
+        if (UNLIKELY(na) && !validate_utf8(s, slen)) {
+            p->cur = s;
+            fail(p, JBIN_ERR_BAD_UTF8);
+            return -1;
+        }
+        tape[(*tc_p)++] = JBIN_TAPE_MAKE_STR(1, pos + 1, slen);
+        return 1;
+    }
+    /* Has backslash → copy segments between escapes using bitmask */
+    uint32_t arena_start = p->arena->string_used;
+    if (UNLIKELY(arena_start + slen >= JBIN_MAX_STRING)) return 0;
+    uint8_t *dst_base = (uint8_t *)p->arena->strings + arena_start;
+    uint8_t *dst = dst_base;
+    uint32_t scan = 0;
+    uint32_t esc_bits = bs;
+    while (esc_bits) {
+        uint32_t bp = (uint32_t)__builtin_ctz(esc_bits);
+        if (bp > scan) { __builtin_memcpy(dst, s + scan, bp - scan); dst += bp - scan; }
+        uint8_t rep = ESC[s[bp + 1]];
+        if (UNLIKELY(!rep)) return 0; /* unicode or bad escape → fall back */
+        *dst++ = rep;
+        scan = bp + 2;
+        esc_bits = _blsr_u64(esc_bits);
+    }
+    if (scan < slen) { __builtin_memcpy(dst, s + scan, slen - scan); dst += slen - scan; }
+    uint32_t out_slen = (uint32_t)(dst - dst_base);
+    p->arena->string_used = arena_start + out_slen;
+    uint32_t na = (uint32_t)_mm256_movemask_epi8(v) & slen_mask;
+    if (UNLIKELY(na) && !validate_utf8(dst_base, out_slen)) {
+        p->arena->string_used = arena_start;
+        p->cur = s;
+        fail(p, JBIN_ERR_BAD_UTF8);
+        return -1;
+    }
+    tape[(*tc_p)++] = JBIN_TAPE_MAKE_STR(0, arena_start, out_slen);
+    return 1;
+}
+
+static int tape_string_fused(P *p, uint64_t *tape, uint32_t *tc_p,
+                              uint32_t known_slen) {
+    if (UNLIKELY(p->cur >= p->end || *p->cur != '"')) {
+        fail(p, JBIN_ERR_UNEXPECTED);
+        return 0;
+    }
+
+    /* Fast path: short string with no backslash/control → zero-copy */
+    if (known_slen <= 16) {
+        const uint8_t *s = p->cur + 1;
+        if (!tape_str_dirty(s, known_slen)) {
+            uint32_t off = (uint32_t)(p->cur - p->input) + 1;
+            tape[(*tc_p)++] = JBIN_TAPE_MAKE_STR(1, off, known_slen);
+            p->cur = s + known_slen + 1;
+            return 1;
+        }
+    }
+
+    p->cur++;
+
+    uint32_t arena_start = p->arena->string_used;
+    uint8_t *dst_base = (uint8_t *)p->arena->strings + arena_start;
+    uint8_t *dst = dst_base;
+    uint32_t capacity = JBIN_MAX_STRING - arena_start;
+    const uint8_t *src = p->cur;
+    const uint8_t *end = p->end;
+    uint8_t *dst_limit = dst_base + capacity - 31;
+    int has_non_ascii = 0;
+
+    const __m256i vquote = _mm256_set1_epi8('"');
+    const __m256i vbackslash = _mm256_set1_epi8('\\');
+    const __m256i vxor = _mm256_set1_epi8((char)0x80);
+    const __m256i vthresh = _mm256_set1_epi8((char)0xA0);
+
+    while (src + 32 <= end && dst <= dst_limit) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)src);
+        uint32_t qmask = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vquote));
+        uint32_t bmask = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vbackslash));
+
+        if (LIKELY(!(qmask | bmask))) {
+            _mm256_storeu_si256((__m256i *)dst, v);
+            has_non_ascii |= (int)_mm256_movemask_epi8(v);
+            src += 32;
+            dst += 32;
+            continue;
+        }
+
+        uint32_t cmask = (uint32_t)_mm256_movemask_epi8(
+            _mm256_cmpgt_epi8(vthresh, _mm256_xor_si256(v, vxor)));
+        uint32_t fpos = (uint32_t)__builtin_ctz(qmask | bmask | cmask);
+
+        has_non_ascii |= (int)_mm256_movemask_epi8(v);
+        _mm256_storeu_si256((__m256i *)dst, v);
+        dst += fpos;
+        src += fpos;
+
+        if (UNLIKELY(cmask & (1u << fpos))) {
+            p->cur = src;
+            fail(p, JBIN_ERR_CONTROL_CHAR);
+            return 0;
+        }
+
+        if (qmask & (1u << fpos)) {
+            uint32_t slen = (uint32_t)(dst - dst_base);
+            p->arena->string_used = arena_start + slen;
+            if (UNLIKELY(has_non_ascii && !validate_utf8(dst_base, slen))) {
+                p->cur = src;
+                fail(p, JBIN_ERR_BAD_UTF8);
+                return 0;
+            }
+            tape[(*tc_p)++] = JBIN_TAPE_MAKE_STR(0, arena_start, slen);
+            p->cur = src + 1;
+            return 1;
+        }
+
+        if (UNLIKELY(src + 1 >= end)) {
+            p->cur = src;
+            fail(p, JBIN_ERR_UNTERMINATED_STRING);
+            return 0;
+        }
+        uint8_t esc_ch = src[1];
+        src += 2;
+        uint8_t rep = ESC[esc_ch];
+        if (LIKELY(rep)) {
+            *dst++ = rep;
+            while (src + 1 < end && *src == '\\') {
+                uint8_t nr = ESC[src[1]];
+                if (!nr) break;
+                *dst++ = nr;
+                src += 2;
+            }
+            continue;
+        }
+        if (LIKELY(esc_ch == 'u')) {
+            if (UNLIKELY(src + 4 > end)) {
+                p->cur = src - 2;
+                fail(p, JBIN_ERR_BAD_UNICODE);
+                return 0;
+            }
+            uint8_t a = HEX[src[0]], b = HEX[src[1]];
+            uint8_t hc = HEX[src[2]], d = HEX[src[3]];
+            if (UNLIKELY((a | b | hc | d) & 0x80)) {
+                p->cur = src - 2;
+                fail(p, JBIN_ERR_BAD_UNICODE);
+                return 0;
+            }
+            uint32_t cp = ((uint32_t)a << 12) | ((uint32_t)b << 8)
+                        | ((uint32_t)hc << 4) | d;
+            src += 4;
+            if (cp >= 0xD800 && cp <= 0xDBFF) {
+                if (UNLIKELY(src + 6 > end || src[0] != '\\' || src[1] != 'u')) {
+                    p->cur = src - 6;
+                    fail(p, JBIN_ERR_BAD_UNICODE);
+                    return 0;
+                }
+                src += 2;
+                uint8_t la = HEX[src[0]], lb = HEX[src[1]];
+                uint8_t lc = HEX[src[2]], ld = HEX[src[3]];
+                if (UNLIKELY((la | lb | lc | ld) & 0x80)) {
+                    p->cur = src - 2;
+                    fail(p, JBIN_ERR_BAD_UNICODE);
+                    return 0;
+                }
+                uint32_t low = ((uint32_t)la << 12) | ((uint32_t)lb << 8)
+                             | ((uint32_t)lc << 4) | ld;
+                src += 4;
+                if (UNLIKELY(low < 0xDC00 || low > 0xDFFF)) {
+                    p->cur = src - 6;
+                    fail(p, JBIN_ERR_BAD_UNICODE);
+                    return 0;
+                }
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+            } else if (UNLIKELY(cp >= 0xDC00 && cp <= 0xDFFF)) {
+                p->cur = src - 6;
+                fail(p, JBIN_ERR_BAD_UNICODE);
+                return 0;
+            }
+            if (UNLIKELY((uint32_t)(dst - dst_base) + 4 > capacity)) {
+                p->cur = src;
+                fail(p, JBIN_ERR_STRING_FULL);
+                return 0;
+            }
+            if (cp <= 0x7F) {
+                *dst++ = (uint8_t)cp;
+            } else if (cp <= 0x7FF) {
+                *dst++ = (uint8_t)(0xC0 | (cp >> 6));
+                *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+            } else if (cp <= 0xFFFF) {
+                *dst++ = (uint8_t)(0xE0 | (cp >> 12));
+                *dst++ = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+            } else {
+                *dst++ = (uint8_t)(0xF0 | (cp >> 18));
+                *dst++ = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
+                *dst++ = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+            }
+        } else {
+            p->cur = src - 2;
+            fail(p, JBIN_ERR_BAD_ESCAPE);
+            return 0;
+        }
+    }
+
+    while (src < end) {
+        if (UNLIKELY((uint32_t)(dst - dst_base) >= capacity)) {
+            p->cur = src;
+            fail(p, JBIN_ERR_STRING_FULL);
+            return 0;
+        }
+        uint8_t ch = *src;
+        if (ch == '"') {
+            uint32_t slen = (uint32_t)(dst - dst_base);
+            p->arena->string_used = arena_start + slen;
+            if (UNLIKELY(has_non_ascii && !validate_utf8(dst_base, slen))) {
+                p->cur = src;
+                fail(p, JBIN_ERR_BAD_UTF8);
+                return 0;
+            }
+            tape[(*tc_p)++] = JBIN_TAPE_MAKE_STR(0, arena_start, slen);
+            p->cur = src + 1;
+            return 1;
+        }
+        if (UNLIKELY(ch < 0x20)) {
+            p->cur = src;
+            fail(p, JBIN_ERR_CONTROL_CHAR);
+            return 0;
+        }
+        if (ch == '\\') {
+            if (UNLIKELY(src + 1 >= end)) {
+                p->cur = src;
+                fail(p, JBIN_ERR_UNTERMINATED_STRING);
+                return 0;
+            }
+            uint8_t esc_ch = src[1];
+            src += 2;
+            uint8_t rep = ESC[esc_ch];
+            if (LIKELY(rep)) {
+                *dst++ = rep;
+            } else if (LIKELY(esc_ch == 'u')) {
+                if (UNLIKELY(src + 4 > end)) {
+                    p->cur = src - 2;
+                    fail(p, JBIN_ERR_BAD_UNICODE);
+                    return 0;
+                }
+                uint8_t a = HEX[src[0]], b = HEX[src[1]];
+                uint8_t hc = HEX[src[2]], d = HEX[src[3]];
+                if (UNLIKELY((a | b | hc | d) & 0x80)) {
+                    p->cur = src - 2;
+                    fail(p, JBIN_ERR_BAD_UNICODE);
+                    return 0;
+                }
+                uint32_t cp = ((uint32_t)a << 12) | ((uint32_t)b << 8)
+                            | ((uint32_t)hc << 4) | d;
+                src += 4;
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                    if (UNLIKELY(src + 6 > end || src[0] != '\\' || src[1] != 'u')) {
+                        p->cur = src - 6;
+                        fail(p, JBIN_ERR_BAD_UNICODE);
+                        return 0;
+                    }
+                    src += 2;
+                    uint8_t la = HEX[src[0]], lb = HEX[src[1]];
+                    uint8_t lc = HEX[src[2]], ld = HEX[src[3]];
+                    if (UNLIKELY((la | lb | lc | ld) & 0x80)) {
+                        p->cur = src - 2;
+                        fail(p, JBIN_ERR_BAD_UNICODE);
+                        return 0;
+                    }
+                    uint32_t low = ((uint32_t)la << 12) | ((uint32_t)lb << 8)
+                                 | ((uint32_t)lc << 4) | ld;
+                    src += 4;
+                    if (UNLIKELY(low < 0xDC00 || low > 0xDFFF)) {
+                        p->cur = src - 6;
+                        fail(p, JBIN_ERR_BAD_UNICODE);
+                        return 0;
+                    }
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                } else if (UNLIKELY(cp >= 0xDC00 && cp <= 0xDFFF)) {
+                    p->cur = src - 6;
+                    fail(p, JBIN_ERR_BAD_UNICODE);
+                    return 0;
+                }
+                if (UNLIKELY((uint32_t)(dst - dst_base) + 4 > capacity)) {
+                    p->cur = src;
+                    fail(p, JBIN_ERR_STRING_FULL);
+                    return 0;
+                }
+                if (cp <= 0x7F) {
+                    *dst++ = (uint8_t)cp;
+                } else if (cp <= 0x7FF) {
+                    *dst++ = (uint8_t)(0xC0 | (cp >> 6));
+                    *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+                } else if (cp <= 0xFFFF) {
+                    *dst++ = (uint8_t)(0xE0 | (cp >> 12));
+                    *dst++ = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                    *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+                } else {
+                    *dst++ = (uint8_t)(0xF0 | (cp >> 18));
+                    *dst++ = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
+                    *dst++ = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                    *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+                }
+            } else {
+                p->cur = src - 2;
+                fail(p, JBIN_ERR_BAD_ESCAPE);
+                return 0;
+            }
+            continue;
+        }
+        has_non_ascii |= (ch >> 7);
+        *dst++ = ch;
+        src++;
+    }
+
+    p->cur = src;
+    fail(p, JBIN_ERR_UNTERMINATED_STRING);
+    return 0;
+}
+
+#if 0 /* deferred batch: experimentally slower for dirty-heavy files */
+NOINLINE int tape_string_batch(P *p, uint64_t *tape) {
+    const __m256i vquote = _mm256_set1_epi8('"');
+    const __m256i vbackslash = _mm256_set1_epi8('\\');
+    const __m256i vxor = _mm256_set1_epi8((char)0x80);
+    const __m256i vthresh = _mm256_set1_epi8((char)0xA0);
+
+    for (uint32_t di = 0; di < p->dirty_count; di++) {
+        /* Prefetch next dirty string's input data */
+        if (di + 4 < p->dirty_count) {
+            uint32_t noff = JBIN_TAPE_OFFSET(tape[p->dirty_buf[di + 4]]);
+            __builtin_prefetch(p->input + noff, 0, 1);
+        }
+
+        uint32_t tape_idx = p->dirty_buf[di];
+        uint64_t entry = tape[tape_idx];
+        uint32_t str_off = JBIN_TAPE_OFFSET(entry);
+
+        const uint8_t *src = p->input + str_off;
+        const uint8_t *end = p->end;
+        uint32_t arena_start = p->arena->string_used;
+        uint8_t *dst_base = (uint8_t *)p->arena->strings + arena_start;
+        uint8_t *dst = dst_base;
+        uint32_t capacity = JBIN_MAX_STRING - arena_start;
+        uint8_t *dst_limit = dst_base + capacity - 31;
+        int has_non_ascii = 0;
+
+        /* AVX2 string processing loop (constants already loaded above) */
+        while (src + 32 <= end && dst <= dst_limit) {
+            __m256i v = _mm256_loadu_si256((const __m256i *)src);
+            uint32_t qmask = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vquote));
+            uint32_t bmask = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, vbackslash));
+
+            if (LIKELY(!(qmask | bmask))) {
+                _mm256_storeu_si256((__m256i *)dst, v);
+                has_non_ascii |= (int)_mm256_movemask_epi8(v);
+                src += 32;
+                dst += 32;
+                continue;
+            }
+
+            uint32_t cmask = (uint32_t)_mm256_movemask_epi8(
+                _mm256_cmpgt_epi8(vthresh, _mm256_xor_si256(v, vxor)));
+            uint32_t fpos = (uint32_t)__builtin_ctz(qmask | bmask | cmask);
+
+            has_non_ascii |= (int)_mm256_movemask_epi8(v);
+            _mm256_storeu_si256((__m256i *)dst, v);
+            dst += fpos;
+            src += fpos;
+
+            if (UNLIKELY(cmask & (1u << fpos))) {
+                p->cur = src;
+                fail(p, JBIN_ERR_CONTROL_CHAR);
+                return 0;
+            }
+
+            if (qmask & (1u << fpos)) {
+                /* Found closing quote */
+                uint32_t slen = (uint32_t)(dst - dst_base);
+                p->arena->string_used = arena_start + slen;
+                if (UNLIKELY(has_non_ascii && !validate_utf8(dst_base, slen))) {
+                    p->cur = src;
+                    fail(p, JBIN_ERR_BAD_UTF8);
+                    return 0;
+                }
+                tape[tape_idx] = JBIN_TAPE_MAKE_STR(0, arena_start, slen);
+                goto next_dirty;
+            }
+
+            /* Backslash escape */
+            if (UNLIKELY(src + 1 >= end)) {
+                p->cur = src;
+                fail(p, JBIN_ERR_UNTERMINATED_STRING);
+                return 0;
+            }
+            uint8_t esc_ch = src[1];
+            src += 2;
+            uint8_t rep = ESC[esc_ch];
+            if (LIKELY(rep)) {
+                *dst++ = rep;
+                while (src + 1 < end && *src == '\\') {
+                    uint8_t nr = ESC[src[1]];
+                    if (!nr) break;
+                    *dst++ = nr;
+                    src += 2;
+                }
+                continue;
+            }
+            if (LIKELY(esc_ch == 'u')) {
+                if (UNLIKELY(src + 4 > end)) {
+                    p->cur = src - 2;
+                    fail(p, JBIN_ERR_BAD_UNICODE);
+                    return 0;
+                }
+                uint8_t a = HEX[src[0]], b = HEX[src[1]];
+                uint8_t hc = HEX[src[2]], d = HEX[src[3]];
+                if (UNLIKELY((a | b | hc | d) & 0x80)) {
+                    p->cur = src - 2;
+                    fail(p, JBIN_ERR_BAD_UNICODE);
+                    return 0;
+                }
+                uint32_t cp = ((uint32_t)a << 12) | ((uint32_t)b << 8)
+                            | ((uint32_t)hc << 4) | d;
+                src += 4;
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                    if (UNLIKELY(src + 6 > end || src[0] != '\\' || src[1] != 'u')) {
+                        p->cur = src - 6;
+                        fail(p, JBIN_ERR_BAD_UNICODE);
+                        return 0;
+                    }
+                    src += 2;
+                    uint8_t la = HEX[src[0]], lb = HEX[src[1]];
+                    uint8_t lc = HEX[src[2]], ld = HEX[src[3]];
+                    if (UNLIKELY((la | lb | lc | ld) & 0x80)) {
+                        p->cur = src - 2;
+                        fail(p, JBIN_ERR_BAD_UNICODE);
+                        return 0;
+                    }
+                    uint32_t low = ((uint32_t)la << 12) | ((uint32_t)lb << 8)
+                                 | ((uint32_t)lc << 4) | ld;
+                    src += 4;
+                    if (UNLIKELY(low < 0xDC00 || low > 0xDFFF)) {
+                        p->cur = src - 6;
+                        fail(p, JBIN_ERR_BAD_UNICODE);
+                        return 0;
+                    }
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                } else if (UNLIKELY(cp >= 0xDC00 && cp <= 0xDFFF)) {
+                    p->cur = src - 6;
+                    fail(p, JBIN_ERR_BAD_UNICODE);
+                    return 0;
+                }
+                if (UNLIKELY((uint32_t)(dst - dst_base) + 4 > capacity)) {
+                    p->cur = src;
+                    fail(p, JBIN_ERR_STRING_FULL);
+                    return 0;
+                }
+                if (cp <= 0x7F) {
+                    *dst++ = (uint8_t)cp;
+                } else if (cp <= 0x7FF) {
+                    *dst++ = (uint8_t)(0xC0 | (cp >> 6));
+                    *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+                } else if (cp <= 0xFFFF) {
+                    *dst++ = (uint8_t)(0xE0 | (cp >> 12));
+                    *dst++ = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                    *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+                } else {
+                    *dst++ = (uint8_t)(0xF0 | (cp >> 18));
+                    *dst++ = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
+                    *dst++ = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                    *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+                }
+            } else {
+                p->cur = src - 2;
+                fail(p, JBIN_ERR_BAD_ESCAPE);
+                return 0;
+            }
+        }
+
+        /* Scalar tail */
+        while (src < end) {
+            if (UNLIKELY((uint32_t)(dst - dst_base) >= capacity)) {
+                p->cur = src;
+                fail(p, JBIN_ERR_STRING_FULL);
+                return 0;
+            }
+            uint8_t ch = *src;
+            if (ch == '"') {
+                uint32_t slen = (uint32_t)(dst - dst_base);
+                p->arena->string_used = arena_start + slen;
+                if (UNLIKELY(has_non_ascii && !validate_utf8(dst_base, slen))) {
+                    p->cur = src;
+                    fail(p, JBIN_ERR_BAD_UTF8);
+                    return 0;
+                }
+                tape[tape_idx] = JBIN_TAPE_MAKE_STR(0, arena_start, slen);
+                goto next_dirty;
+            }
+            if (UNLIKELY(ch < 0x20)) {
+                p->cur = src;
+                fail(p, JBIN_ERR_CONTROL_CHAR);
+                return 0;
+            }
+            if (ch == '\\') {
+                if (UNLIKELY(src + 1 >= end)) {
+                    p->cur = src;
+                    fail(p, JBIN_ERR_UNTERMINATED_STRING);
+                    return 0;
+                }
+                uint8_t esc_ch = src[1];
+                src += 2;
+                uint8_t rep = ESC[esc_ch];
+                if (LIKELY(rep)) {
+                    *dst++ = rep;
+                } else if (LIKELY(esc_ch == 'u')) {
+                    if (UNLIKELY(src + 4 > end)) {
+                        p->cur = src - 2;
+                        fail(p, JBIN_ERR_BAD_UNICODE);
+                        return 0;
+                    }
+                    uint8_t a = HEX[src[0]], b = HEX[src[1]];
+                    uint8_t hc = HEX[src[2]], d = HEX[src[3]];
+                    if (UNLIKELY((a | b | hc | d) & 0x80)) {
+                        p->cur = src - 2;
+                        fail(p, JBIN_ERR_BAD_UNICODE);
+                        return 0;
+                    }
+                    uint32_t cp = ((uint32_t)a << 12) | ((uint32_t)b << 8)
+                                | ((uint32_t)hc << 4) | d;
+                    src += 4;
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {
+                        if (UNLIKELY(src + 6 > end || src[0] != '\\' || src[1] != 'u')) {
+                            p->cur = src - 6;
+                            fail(p, JBIN_ERR_BAD_UNICODE);
+                            return 0;
+                        }
+                        src += 2;
+                        uint8_t la = HEX[src[0]], lb = HEX[src[1]];
+                        uint8_t lc = HEX[src[2]], ld = HEX[src[3]];
+                        if (UNLIKELY((la | lb | lc | ld) & 0x80)) {
+                            p->cur = src - 2;
+                            fail(p, JBIN_ERR_BAD_UNICODE);
+                            return 0;
+                        }
+                        uint32_t low = ((uint32_t)la << 12) | ((uint32_t)lb << 8)
+                                     | ((uint32_t)lc << 4) | ld;
+                        src += 4;
+                        if (UNLIKELY(low < 0xDC00 || low > 0xDFFF)) {
+                            p->cur = src - 6;
+                            fail(p, JBIN_ERR_BAD_UNICODE);
+                            return 0;
+                        }
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                    } else if (UNLIKELY(cp >= 0xDC00 && cp <= 0xDFFF)) {
+                        p->cur = src - 6;
+                        fail(p, JBIN_ERR_BAD_UNICODE);
+                        return 0;
+                    }
+                    if (UNLIKELY((uint32_t)(dst - dst_base) + 4 > capacity)) {
+                        p->cur = src;
+                        fail(p, JBIN_ERR_STRING_FULL);
+                        return 0;
+                    }
+                    if (cp <= 0x7F) {
+                        *dst++ = (uint8_t)cp;
+                    } else if (cp <= 0x7FF) {
+                        *dst++ = (uint8_t)(0xC0 | (cp >> 6));
+                        *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+                    } else if (cp <= 0xFFFF) {
+                        *dst++ = (uint8_t)(0xE0 | (cp >> 12));
+                        *dst++ = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                        *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+                    } else {
+                        *dst++ = (uint8_t)(0xF0 | (cp >> 18));
+                        *dst++ = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
+                        *dst++ = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+                        *dst++ = (uint8_t)(0x80 | (cp & 0x3F));
+                    }
+                } else {
+                    p->cur = src - 2;
+                    fail(p, JBIN_ERR_BAD_ESCAPE);
+                    return 0;
+                }
+                continue;
+            }
+            has_non_ascii |= (ch >> 7);
+            *dst++ = ch;
+            src++;
+        }
+
+        p->cur = src;
+        fail(p, JBIN_ERR_UNTERMINATED_STRING);
+        return 0;
+
+    next_dirty: ;
+    }
+    return 1;
+}
+#endif /* deferred batch */
+
+FINLINE int parse_number_s2_tape(P *p, const uint8_t *start,
+                                  uint64_t *tape, uint32_t *tc_p) {
+    const uint8_t *cur = start;
+
+    if (*cur == '-') cur++;
+
+    if (UNLIKELY((uint32_t)(*cur - '0') > 9u)) {
+        p->cur = cur;
+        fail(p, JBIN_ERR_BAD_NUMBER);
+        return 0;
+    }
+
+    if (*cur == '0') {
+        cur++;
+        if (UNLIKELY((uint32_t)(*cur - '0') <= 9u)) {
+            p->cur = cur;
+            fail(p, JBIN_ERR_BAD_NUMBER);
+            return 0;
+        }
+    } else {
+        cur++;
+        skip_digits_nobound(&cur);
+    }
+
+    if (*cur == '.') {
+        cur++;
+        if (UNLIKELY((uint32_t)(*cur - '0') > 9u)) {
+            p->cur = cur;
+            fail(p, JBIN_ERR_BAD_NUMBER);
+            return 0;
+        }
+        cur++;
+        skip_digits_nobound(&cur);
+    }
+
+    if (*cur == 'e' || *cur == 'E') {
+        cur++;
+        if (*cur == '+' || *cur == '-') cur++;
+        if (UNLIKELY((uint32_t)(*cur - '0') > 9u)) {
+            p->cur = cur;
+            fail(p, JBIN_ERR_BAD_NUMBER);
+            return 0;
+        }
+        do { cur++; } while ((uint32_t)(*cur - '0') <= 9u);
+    }
+
+    if (UNLIKELY(*cur > 0x20 && *cur != ',' && *cur != ']' && *cur != '}')) {
+        p->cur = cur;
+        fail(p, JBIN_ERR_BAD_NUMBER);
+        return 0;
+    }
+
+    uint32_t off = (uint32_t)(start - p->input);
+    uint32_t len = (uint32_t)(cur - start);
+    tape[(*tc_p)++] = JBIN_TAPE_MAKE_NUM(1, off, len);
+    return 1;
+}
+
+FINLINE int parse_number_tape_bounded(P *p, uint64_t *tape, uint32_t *tc_p) {
+    const uint8_t *start = p->cur;
+
+    if (p->cur < p->end && *p->cur == '-') p->cur++;
+
+    if (UNLIKELY(p->cur >= p->end || (uint32_t)(*p->cur - '0') > 9u)) {
+        fail(p, JBIN_ERR_BAD_NUMBER);
+        return 0;
+    }
+
+    if (*p->cur == '0') {
+        p->cur++;
+        if (UNLIKELY(p->cur < p->end && (uint32_t)(*p->cur - '0') <= 9u)) {
+            fail(p, JBIN_ERR_BAD_NUMBER);
+            return 0;
+        }
+    } else {
+        p->cur++;
+        skip_digits(&p->cur, p->end);
+    }
+
+    if (p->cur < p->end && *p->cur == '.') {
+        p->cur++;
+        if (UNLIKELY(p->cur >= p->end || (uint32_t)(*p->cur - '0') > 9u)) {
+            fail(p, JBIN_ERR_BAD_NUMBER);
+            return 0;
+        }
+        p->cur++;
+        skip_digits(&p->cur, p->end);
+    }
+
+    if (p->cur < p->end && (*p->cur == 'e' || *p->cur == 'E')) {
+        p->cur++;
+        if (p->cur < p->end && (*p->cur == '+' || *p->cur == '-'))
+            p->cur++;
+        if (UNLIKELY(p->cur >= p->end || (uint32_t)(*p->cur - '0') > 9u)) {
+            fail(p, JBIN_ERR_BAD_NUMBER);
+            return 0;
+        }
+        do { p->cur++; } while (p->cur < p->end && (uint32_t)(*p->cur - '0') <= 9u);
+    }
+
+    if (UNLIKELY(p->cur < p->end
+        && *p->cur != ',' && *p->cur != '}' && *p->cur != ']'
+        && *p->cur != ' ' && *p->cur != '\n' && *p->cur != '\r' && *p->cur != '\t')) {
+        fail(p, JBIN_ERR_BAD_NUMBER);
+        return 0;
+    }
+
+    uint32_t off = (uint32_t)(start - p->input);
+    uint32_t len = (uint32_t)(p->cur - start);
+    tape[(*tc_p)++] = JBIN_TAPE_MAKE_NUM(1, off, len);
+    return 1;
+}
+
+FINLINE uint32_t stage2_tape_core(P *p, SiIter *itp, const uint8_t *dirty,
+                                   const int all_clean) {
+    TapeFrame stack[JBIN_MAX_DEPTH];
+    int sp = -1;
+    uint64_t *tape = p->arena->tape;
+    const uint8_t *input = p->input;
+
+    /* AVX2 constants for inline string fast-check */
+    const __m256i vbs_s2 = _mm256_set1_epi8('\\');
+    const __m256i vxor_s2 = _mm256_set1_epi8((char)0x80);
+    const __m256i vthresh_s2 = _mm256_set1_epi8((char)0xA0);
+
+    SiIter it = *itp;
+    uint32_t last_pos = 0;
+    uint32_t tc = 0;
+    uint32_t pos;
+    uint8_t c;
+
+do_value:
+    if (UNLIKELY(!si_has(&it))) {
+        p->error = JBIN_ERR_UNEXPECTED;
+        p->error_pos = last_pos;
+        return JBIN_NONE;
+    }
+    if (UNLIKELY(tc + 3 >= JBIN_MAX_TAPE)) {
+        p->error = JBIN_ERR_NODES_FULL;
+        p->error_pos = last_pos;
+        return JBIN_NONE;
+    }
+    pos = si_next(&it);
+    c = input[pos];
+do_dispatch: ;
+    {
+        if (c == '"') {
+            uint32_t close_pos = si_next(&it);
+            uint32_t slen = close_pos - pos - 1;
+            if (all_clean || LIKELY(!(dirty[pos >> 6] | dirty[close_pos >> 6]))) {
+                tape[tc++] = JBIN_TAPE_MAKE_STR(1, pos + 1, slen);
+            } else {
+                int fast = tape_string_inline(p, input, tape, &tc, pos, slen,
+                                                  vbs_s2, vxor_s2, vthresh_s2);
+                if (fast == 0) {
+                    p->cur = input + pos;
+                    if (UNLIKELY(!tape_string_fused(p, tape, &tc, slen)))
+                        return JBIN_NONE;
+                } else if (UNLIKELY(fast < 0))
+                    return JBIN_NONE;
+            }
+            last_pos = pos;
+            goto have_value;
+        }
+        if (c == '-' || (uint32_t)(c - '0') <= 9u) {
+            if (LIKELY(si_has(&it))) {
+                if (UNLIKELY(!parse_number_s2_tape(p, input + pos, tape, &tc)))
+                    return JBIN_NONE;
+            } else {
+                p->cur = input + pos;
+                if (UNLIKELY(!parse_number_tape_bounded(p, tape, &tc)))
+                    return JBIN_NONE;
+            }
+            last_pos = pos;
+            goto have_value;
+        }
+        if (c == 't') {
+            uint32_t w; __builtin_memcpy(&w, input + pos, 4);
+            if (LIKELY(w == 0x65757274u)) {
+                tape[tc++] = JBIN_TAPE_MAKE_LIT(JBIN_TAPE_TRUE);
+                last_pos = pos;
+                goto have_value;
+            }
+            p->cur = input + pos;
+            fail(p, JBIN_ERR_BAD_LITERAL);
+            return JBIN_NONE;
+        }
+        if (c == 'f') {
+            uint32_t w; __builtin_memcpy(&w, input + pos + 1, 4);
+            if (LIKELY(w == 0x65736c61u)) {
+                tape[tc++] = JBIN_TAPE_MAKE_LIT(JBIN_TAPE_FALSE);
+                last_pos = pos;
+                goto have_value;
+            }
+            p->cur = input + pos;
+            fail(p, JBIN_ERR_BAD_LITERAL);
+            return JBIN_NONE;
+        }
+        if (c == 'n') {
+            uint32_t w; __builtin_memcpy(&w, input + pos, 4);
+            if (LIKELY(w == 0x6c6c756eu)) {
+                tape[tc++] = JBIN_TAPE_MAKE_LIT(JBIN_TAPE_NULL);
+                last_pos = pos;
+                goto have_value;
+            }
+            p->cur = input + pos;
+            fail(p, JBIN_ERR_BAD_LITERAL);
+            return JBIN_NONE;
+        }
+        if (c == '[') {
+            last_pos = pos;
+            if (UNLIKELY(sp >= JBIN_MAX_DEPTH - 1)) {
+                p->cur = input + pos;
+                fail(p, JBIN_ERR_DEPTH);
+                return JBIN_NONE;
+            }
+            uint32_t open_idx = tc;
+            tape[tc++] = JBIN_TAPE_MAKE_OPEN(JBIN_TAPE_AOPEN);
+            if (UNLIKELY(!si_has(&it))) {
+                p->error = JBIN_ERR_UNEXPECTED;
+                p->error_pos = pos;
+                return JBIN_NONE;
+            }
+            {
+                uint32_t fpos = si_pos(&it);
+                uint8_t fc = input[fpos];
+                if (fc == ']') {
+                    last_pos = fpos;
+                    si_advance(&it);
+                    tape[open_idx] = ((uint64_t)JBIN_TAPE_AOPEN << 61) | tc;
+                    tape[tc++] = JBIN_TAPE_MAKE_CLOSE(0, open_idx);
+                    goto have_value;
+                }
+                /* Tight inner loop for arrays of literals (true/false/null) */
+                if (fc == 't' || fc == 'f' || fc == 'n') {
+                    for (;;) {
+                        uint32_t vpos = si_next(&it);
+                        uint8_t vc = input[vpos];
+                        if (vc == 't') {
+                            uint32_t w; __builtin_memcpy(&w, input + vpos, 4);
+                            if (UNLIKELY(w != 0x65757274u)) {
+                                p->cur = input + vpos;
+                                fail(p, JBIN_ERR_BAD_LITERAL);
+                                return JBIN_NONE;
+                            }
+                            tape[tc++] = JBIN_TAPE_MAKE_LIT(JBIN_TAPE_TRUE);
+                        } else if (vc == 'f') {
+                            uint32_t w; __builtin_memcpy(&w, input + vpos + 1, 4);
+                            if (UNLIKELY(w != 0x65736c61u)) {
+                                p->cur = input + vpos;
+                                fail(p, JBIN_ERR_BAD_LITERAL);
+                                return JBIN_NONE;
+                            }
+                            tape[tc++] = JBIN_TAPE_MAKE_LIT(JBIN_TAPE_FALSE);
+                        } else if (vc == 'n') {
+                            uint32_t w; __builtin_memcpy(&w, input + vpos, 4);
+                            if (UNLIKELY(w != 0x6c6c756eu)) {
+                                p->cur = input + vpos;
+                                fail(p, JBIN_ERR_BAD_LITERAL);
+                                return JBIN_NONE;
+                            }
+                            tape[tc++] = JBIN_TAPE_MAKE_LIT(JBIN_TAPE_NULL);
+                        } else {
+                            /* Non-literal: push frame, fall to generic dispatch */
+                            pos = vpos;
+                            c = vc;
+                            sp++;
+                            stack[sp].open_idx = open_idx;
+                            stack[sp].is_obj = 0;
+                            goto do_dispatch;
+                        }
+                        if (UNLIKELY(!si_has(&it))) {
+                            p->error = JBIN_ERR_UNEXPECTED;
+                            p->error_pos = vpos;
+                            return JBIN_NONE;
+                        }
+                        if (UNLIKELY(tc + 3 >= JBIN_MAX_TAPE)) {
+                            p->error = JBIN_ERR_NODES_FULL;
+                            p->error_pos = vpos;
+                            return JBIN_NONE;
+                        }
+                        uint32_t npos = si_next(&it);
+                        if (input[npos] == ']') {
+                            last_pos = npos;
+                            tape[open_idx] = ((uint64_t)JBIN_TAPE_AOPEN << 61) | tc;
+                            tape[tc++] = JBIN_TAPE_MAKE_CLOSE(0, open_idx);
+                            goto have_value;
+                        }
+                        /* npos is comma — continue */
+                    }
+                }
+            }
+            sp++;
+            stack[sp].open_idx = open_idx;
+            stack[sp].is_obj = 0;
+            goto do_value;
+        }
+        if (c == '{') {
+            last_pos = pos;
+            if (UNLIKELY(sp >= JBIN_MAX_DEPTH - 1)) {
+                p->cur = input + pos;
+                fail(p, JBIN_ERR_DEPTH);
+                return JBIN_NONE;
+            }
+            uint32_t open_idx = tc;
+            tape[tc++] = JBIN_TAPE_MAKE_OPEN(JBIN_TAPE_OOPEN);
+            if (UNLIKELY(!si_has(&it))) {
+                p->error = JBIN_ERR_UNEXPECTED;
+                p->error_pos = pos;
+                return JBIN_NONE;
+            }
+            {
+                uint32_t npos = si_next(&it);
+                uint8_t fc = input[npos];
+                if (fc == '}') {
+                    last_pos = npos;
+                    tape[open_idx] = ((uint64_t)JBIN_TAPE_OOPEN << 61) | tc;
+                    tape[tc++] = JBIN_TAPE_MAKE_CLOSE(1, open_idx);
+                    goto have_value;
+                }
+                if (UNLIKELY(fc != '"')) {
+                    p->error = JBIN_ERR_EXPECTED_KEY;
+                    p->error_pos = npos;
+                    return JBIN_NONE;
+                }
+                uint32_t kclose = si_next(&it);
+                uint32_t klen = kclose - npos - 1;
+                if (all_clean || LIKELY(!(dirty[npos >> 6] | dirty[kclose >> 6]))) {
+                    tape[tc++] = JBIN_TAPE_MAKE_STR(1, npos + 1, klen);
+                } else {
+                    int fast = tape_string_inline(p, input, tape, &tc, npos, klen,
+                                                      vbs_s2, vxor_s2, vthresh_s2);
+                    if (fast == 0) {
+                        p->cur = input + npos;
+                        if (UNLIKELY(!tape_string_fused(p, tape, &tc, klen)))
+                            return JBIN_NONE;
+                    } else if (UNLIKELY(fast < 0))
+                        return JBIN_NONE;
+                }
+            }
+            {
+                uint32_t cpos = si_next(&it);
+                if (UNLIKELY(input[cpos] != ':')) {
+                    p->error = JBIN_ERR_EXPECTED_COLON;
+                    p->error_pos = cpos;
+                    return JBIN_NONE;
+                }
+            }
+            sp++;
+            stack[sp].open_idx = open_idx;
+            stack[sp].is_obj = 1;
+            goto do_value;
+        }
+    }
+
+    p->error = JBIN_ERR_UNEXPECTED;
+    p->error_pos = si_pos(&it);
+    return JBIN_NONE;
+
+have_value:
+    if (sp < 0) {
+        if (UNLIKELY(si_has(&it))) {
+            p->error = JBIN_ERR_TRAILING;
+            p->error_pos = si_pos(&it);
+            return JBIN_NONE;
+        }
+        p->node_count = tc;
+        return 0;
+    }
+
+    if (stack[sp].is_obj) {
+        if (UNLIKELY(!si_has(&it))) {
+            p->error = JBIN_ERR_UNEXPECTED;
+            p->error_pos = last_pos;
+            return JBIN_NONE;
+        }
+        {
+            uint32_t npos = si_next(&it);
+            if (input[npos] == '}') {
+                last_pos = npos;
+                uint32_t oi = stack[sp].open_idx;
+                tape[oi] = ((uint64_t)JBIN_TAPE_OOPEN << 61) | tc;
+                tape[tc++] = JBIN_TAPE_MAKE_CLOSE(1, oi);
+                sp--;
+                goto have_value;
+            }
+            if (UNLIKELY(input[npos] != ',')) {
+                p->error = JBIN_ERR_UNEXPECTED;
+                p->error_pos = npos;
+                return JBIN_NONE;
+            }
+        }
+
+        {
+            uint32_t npos = si_next(&it);
+            if (UNLIKELY(input[npos] != '"')) {
+                p->error = JBIN_ERR_EXPECTED_KEY;
+                p->error_pos = npos;
+                return JBIN_NONE;
+            }
+            uint32_t kclose = si_next(&it);
+            uint32_t klen = kclose - npos - 1;
+            if (all_clean || LIKELY(!(dirty[npos >> 6] | dirty[kclose >> 6]))) {
+                tape[tc++] = JBIN_TAPE_MAKE_STR(1, npos + 1, klen);
+            } else {
+                int fast = tape_string_inline(p, input, tape, &tc, npos, klen,
+                                                  vbs_s2, vxor_s2, vthresh_s2);
+                if (fast == 0) {
+                    p->cur = input + npos;
+                    if (UNLIKELY(!tape_string_fused(p, tape, &tc, klen)))
+                        return JBIN_NONE;
+                } else if (UNLIKELY(fast < 0))
+                    return JBIN_NONE;
+            }
+        }
+
+        {
+            uint32_t cpos = si_next(&it);
+            if (UNLIKELY(input[cpos] != ':')) {
+                p->error = JBIN_ERR_EXPECTED_COLON;
+                p->error_pos = cpos;
+                return JBIN_NONE;
+            }
+        }
+
+        /* Fused: fetch next value structural without going through do_value */
+        if (UNLIKELY(!si_has(&it))) {
+            p->error = JBIN_ERR_UNEXPECTED;
+            p->error_pos = last_pos;
+            return JBIN_NONE;
+        }
+        if (UNLIKELY(tc + 3 >= JBIN_MAX_TAPE)) {
+            p->error = JBIN_ERR_NODES_FULL;
+            p->error_pos = last_pos;
+            return JBIN_NONE;
+        }
+        pos = si_next(&it);
+        c = input[pos];
+        goto do_dispatch;
+    }
+
+    if (UNLIKELY(!si_has(&it))) {
+        p->error = JBIN_ERR_UNEXPECTED;
+        p->error_pos = last_pos;
+        return JBIN_NONE;
+    }
+    {
+        uint32_t npos = si_next(&it);
+        if (input[npos] == ']') {
+            last_pos = npos;
+            uint32_t oi = stack[sp].open_idx;
+            tape[oi] = ((uint64_t)JBIN_TAPE_AOPEN << 61) | tc;
+            tape[tc++] = JBIN_TAPE_MAKE_CLOSE(0, oi);
+            sp--;
+            goto have_value;
+        }
+        if (UNLIKELY(input[npos] != ',')) {
+            p->error = JBIN_ERR_UNEXPECTED;
+            p->error_pos = npos;
+            return JBIN_NONE;
+        }
+    }
+    /* Fused: fetch next value structural without going through do_value */
+    if (UNLIKELY(!si_has(&it))) {
+        p->error = JBIN_ERR_UNEXPECTED;
+        p->error_pos = last_pos;
+        return JBIN_NONE;
+    }
+    if (UNLIKELY(tc + 3 >= JBIN_MAX_TAPE)) {
+        p->error = JBIN_ERR_NODES_FULL;
+        p->error_pos = last_pos;
+        return JBIN_NONE;
+    }
+    pos = si_next(&it);
+    c = input[pos];
+    goto do_dispatch;
+}
+
+static uint32_t stage2_tape_bitmask(P *p, SiIter *itp, const uint8_t *dirty) {
+    return stage2_tape_core(p, itp, dirty, 0);
+}
+
+static uint32_t stage2_tape_clean(P *p, SiIter *itp) {
+    return stage2_tape_core(p, itp, NULL, 1);
+}
+
+#endif /* JBIN_TWOPASS */
+
+#if 0 /* flat-index stage2: experimentally slower than SiIter */
+FINLINE uint32_t stage2_tape_flat(P *p, const uint32_t *si,
+                                   const uint32_t *si_end,
+                                   const uint8_t *dirty,
+                                   const int all_clean) {
+    TapeFrame stack[JBIN_MAX_DEPTH];
+    int sp = -1;
+    uint64_t *tape = p->arena->tape;
+    const uint8_t *input = p->input;
+
+    uint32_t last_pos = 0;
+    uint32_t tc = 0;
+    uint32_t pos;
+    uint8_t c;
+
+do_value:
+    if (UNLIKELY(si >= si_end)) {
+        p->error = JBIN_ERR_UNEXPECTED;
+        p->error_pos = last_pos;
+        return JBIN_NONE;
+    }
+    if (UNLIKELY(tc + 3 >= JBIN_MAX_TAPE)) {
+        p->error = JBIN_ERR_NODES_FULL;
+        p->error_pos = last_pos;
+        return JBIN_NONE;
+    }
+    pos = *si++;
+    c = input[pos];
+do_dispatch: ;
+    {
+        __builtin_prefetch(input + si[8], 0, 1);
+        if (c == '"') {
+            uint32_t close_pos = *si++;
+            uint32_t slen = close_pos - pos - 1;
+            if (all_clean || LIKELY(!(dirty[pos >> 6] | dirty[close_pos >> 6]))) {
+                tape[tc++] = JBIN_TAPE_MAKE_STR(1, pos + 1, slen);
+            } else {
+                p->cur = input + pos;
+                if (UNLIKELY(!tape_string_fused(p, tape, &tc)))
+                    return JBIN_NONE;
+            }
+            last_pos = pos;
+            goto have_value;
+        }
+        if (c == '-' || (uint32_t)(c - '0') <= 9u) {
+            if (LIKELY(si < si_end)) {
+                if (UNLIKELY(!parse_number_s2_tape(p, input + pos, tape, &tc)))
+                    return JBIN_NONE;
+            } else {
+                p->cur = input + pos;
+                if (UNLIKELY(!parse_number_tape_bounded(p, tape, &tc)))
+                    return JBIN_NONE;
+            }
+            last_pos = pos;
+            goto have_value;
+        }
+        if (c == 't') {
+            uint32_t w; __builtin_memcpy(&w, input + pos, 4);
+            if (LIKELY(w == 0x65757274u)) {
+                tape[tc++] = JBIN_TAPE_MAKE_LIT(JBIN_TAPE_TRUE);
+                last_pos = pos;
+                goto have_value;
+            }
+            p->cur = input + pos;
+            fail(p, JBIN_ERR_BAD_LITERAL);
+            return JBIN_NONE;
+        }
+        if (c == 'f') {
+            uint32_t w; __builtin_memcpy(&w, input + pos + 1, 4);
+            if (LIKELY(w == 0x65736c61u)) {
+                tape[tc++] = JBIN_TAPE_MAKE_LIT(JBIN_TAPE_FALSE);
+                last_pos = pos;
+                goto have_value;
+            }
+            p->cur = input + pos;
+            fail(p, JBIN_ERR_BAD_LITERAL);
+            return JBIN_NONE;
+        }
+        if (c == 'n') {
+            uint32_t w; __builtin_memcpy(&w, input + pos, 4);
+            if (LIKELY(w == 0x6c6c756eu)) {
+                tape[tc++] = JBIN_TAPE_MAKE_LIT(JBIN_TAPE_NULL);
+                last_pos = pos;
+                goto have_value;
+            }
+            p->cur = input + pos;
+            fail(p, JBIN_ERR_BAD_LITERAL);
+            return JBIN_NONE;
+        }
+        if (c == '[') {
+            last_pos = pos;
+            if (UNLIKELY(sp >= JBIN_MAX_DEPTH - 1)) {
+                p->cur = input + pos;
+                fail(p, JBIN_ERR_DEPTH);
+                return JBIN_NONE;
+            }
+            uint32_t open_idx = tc;
+            tape[tc++] = JBIN_TAPE_MAKE_OPEN(JBIN_TAPE_AOPEN);
+            if (UNLIKELY(si >= si_end)) {
+                p->error = JBIN_ERR_UNEXPECTED;
+                p->error_pos = pos;
+                return JBIN_NONE;
+            }
+            {
+                uint32_t fpos = *si;
+                if (input[fpos] == ']') {
+                    last_pos = fpos;
+                    si++;
+                    tape[open_idx] = ((uint64_t)JBIN_TAPE_AOPEN << 61) | tc;
+                    tape[tc++] = JBIN_TAPE_MAKE_CLOSE(0, open_idx);
+                    goto have_value;
+                }
+            }
+            sp++;
+            stack[sp].open_idx = open_idx;
+            stack[sp].is_obj = 0;
+            goto do_value;
+        }
+        if (c == '{') {
+            last_pos = pos;
+            if (UNLIKELY(sp >= JBIN_MAX_DEPTH - 1)) {
+                p->cur = input + pos;
+                fail(p, JBIN_ERR_DEPTH);
+                return JBIN_NONE;
+            }
+            uint32_t open_idx = tc;
+            tape[tc++] = JBIN_TAPE_MAKE_OPEN(JBIN_TAPE_OOPEN);
+            if (UNLIKELY(si >= si_end)) {
+                p->error = JBIN_ERR_UNEXPECTED;
+                p->error_pos = pos;
+                return JBIN_NONE;
+            }
+            {
+                uint32_t npos = *si++;
+                uint8_t fc = input[npos];
+                if (fc == '}') {
+                    last_pos = npos;
+                    tape[open_idx] = ((uint64_t)JBIN_TAPE_OOPEN << 61) | tc;
+                    tape[tc++] = JBIN_TAPE_MAKE_CLOSE(1, open_idx);
+                    goto have_value;
+                }
+                if (UNLIKELY(fc != '"')) {
+                    p->error = JBIN_ERR_EXPECTED_KEY;
+                    p->error_pos = npos;
+                    return JBIN_NONE;
+                }
+                uint32_t kclose = *si++;
+                uint32_t klen = kclose - npos - 1;
+                if (all_clean || LIKELY(!(dirty[npos >> 6] | dirty[kclose >> 6]))) {
+                    tape[tc++] = JBIN_TAPE_MAKE_STR(1, npos + 1, klen);
+                } else {
+                    p->cur = input + npos;
+                    if (UNLIKELY(!tape_string_fused(p, tape, &tc)))
+                        return JBIN_NONE;
+                }
+            }
+            {
+                uint32_t cpos = *si++;
+                if (UNLIKELY(input[cpos] != ':')) {
+                    p->error = JBIN_ERR_EXPECTED_COLON;
+                    p->error_pos = cpos;
+                    return JBIN_NONE;
+                }
+            }
+            sp++;
+            stack[sp].open_idx = open_idx;
+            stack[sp].is_obj = 1;
+            goto do_value;
+        }
+    }
+
+    p->error = JBIN_ERR_UNEXPECTED;
+    p->error_pos = (si < si_end) ? *si : last_pos;
+    return JBIN_NONE;
+
+have_value:
+    if (sp < 0) {
+        if (UNLIKELY(si < si_end)) {
+            p->error = JBIN_ERR_TRAILING;
+            p->error_pos = *si;
+            return JBIN_NONE;
+        }
+        p->node_count = tc;
+        return 0;
+    }
+
+    if (stack[sp].is_obj) {
+        if (UNLIKELY(si >= si_end)) {
+            p->error = JBIN_ERR_UNEXPECTED;
+            p->error_pos = last_pos;
+            return JBIN_NONE;
+        }
+        {
+            uint32_t npos = *si++;
+            if (input[npos] == '}') {
+                last_pos = npos;
+                uint32_t oi = stack[sp].open_idx;
+                tape[oi] = ((uint64_t)JBIN_TAPE_OOPEN << 61) | tc;
+                tape[tc++] = JBIN_TAPE_MAKE_CLOSE(1, oi);
+                sp--;
+                goto have_value;
+            }
+            if (UNLIKELY(input[npos] != ',')) {
+                p->error = JBIN_ERR_UNEXPECTED;
+                p->error_pos = npos;
+                return JBIN_NONE;
+            }
+        }
+
+        {
+            uint32_t npos = *si++;
+            if (UNLIKELY(input[npos] != '"')) {
+                p->error = JBIN_ERR_EXPECTED_KEY;
+                p->error_pos = npos;
+                return JBIN_NONE;
+            }
+            uint32_t kclose = *si++;
+            uint32_t klen = kclose - npos - 1;
+            if (all_clean || LIKELY(!(dirty[npos >> 6] | dirty[kclose >> 6]))) {
+                tape[tc++] = JBIN_TAPE_MAKE_STR(1, npos + 1, klen);
+            } else {
+                p->cur = input + npos;
+                if (UNLIKELY(!tape_string_fused(p, tape, &tc)))
+                    return JBIN_NONE;
+            }
+        }
+
+        {
+            uint32_t cpos = *si++;
+            if (UNLIKELY(input[cpos] != ':')) {
+                p->error = JBIN_ERR_EXPECTED_COLON;
+                p->error_pos = cpos;
+                return JBIN_NONE;
+            }
+        }
+
+        if (UNLIKELY(si >= si_end)) {
+            p->error = JBIN_ERR_UNEXPECTED;
+            p->error_pos = last_pos;
+            return JBIN_NONE;
+        }
+        if (UNLIKELY(tc + 3 >= JBIN_MAX_TAPE)) {
+            p->error = JBIN_ERR_NODES_FULL;
+            p->error_pos = last_pos;
+            return JBIN_NONE;
+        }
+        pos = *si++;
+        c = input[pos];
+        goto do_dispatch;
+    }
+
+    if (UNLIKELY(si >= si_end)) {
+        p->error = JBIN_ERR_UNEXPECTED;
+        p->error_pos = last_pos;
+        return JBIN_NONE;
+    }
+    {
+        uint32_t npos = *si++;
+        if (input[npos] == ']') {
+            last_pos = npos;
+            uint32_t oi = stack[sp].open_idx;
+            tape[oi] = ((uint64_t)JBIN_TAPE_AOPEN << 61) | tc;
+            tape[tc++] = JBIN_TAPE_MAKE_CLOSE(0, oi);
+            sp--;
+            goto have_value;
+        }
+        if (UNLIKELY(input[npos] != ',')) {
+            p->error = JBIN_ERR_UNEXPECTED;
+            p->error_pos = npos;
+            return JBIN_NONE;
+        }
+    }
+    if (UNLIKELY(si >= si_end)) {
+        p->error = JBIN_ERR_UNEXPECTED;
+        p->error_pos = last_pos;
+        return JBIN_NONE;
+    }
+    if (UNLIKELY(tc + 3 >= JBIN_MAX_TAPE)) {
+        p->error = JBIN_ERR_NODES_FULL;
+        p->error_pos = last_pos;
+        return JBIN_NONE;
+    }
+    pos = *si++;
+    c = input[pos];
+    goto do_dispatch;
+}
+
+static uint32_t stage2_tape_flat_dirty(P *p, const uint32_t *si,
+                                        const uint32_t *si_end,
+                                        const uint8_t *dirty) {
+    return stage2_tape_flat(p, si, si_end, dirty, 0);
+}
+
+static uint32_t stage2_tape_flat_clean(P *p, const uint32_t *si,
+                                        const uint32_t *si_end) {
+    return stage2_tape_flat(p, si, si_end, NULL, 1);
+}
+#endif /* flat-index stage2 */
 
 static uint32_t parse_root(P *p) {
     Frame stack[JBIN_MAX_DEPTH];
@@ -1849,39 +3336,41 @@ JbinResult jbin_parse(JbinArena *arena, const char *input, uint32_t length) {
 
     arena->node_count = 0;
     arena->string_used = 0;
+    arena->is_tape = 0;
     p.node_count = 0;
 
 #ifdef JBIN_TWOPASS
     if (LIKELY(length >= 64)) {
         uint32_t sample_off = length / 4;
-        uint32_t numeric = 0;
+        uint32_t numeric = 0, ws = 0, quotes = 0;
         for (uint32_t i = 0; i < 64; i++) {
             uint8_t c = p.input[sample_off + i];
             numeric += ((uint32_t)(c - '0') <= 9u) | (c == '.') | (c == '-');
+            ws += (c == ' ') | (c == '\n') | (c == '\r') | (c == '\t');
+            quotes += (c == '"');
         }
 
-        if (numeric < 40 || length > (8u * 1024u * 1024u)) {
-            uint64_t *bm = (uint64_t *)arena->structural;
-            uint32_t total_bytes = JBIN_MAX_STRUCTURAL * (uint32_t)sizeof(uint32_t);
-            uint32_t bm_cap = total_bytes / ((uint32_t)sizeof(uint64_t) + 1);
-            uint8_t *dirty_flags = (uint8_t *)(bm + bm_cap);
-            uint32_t num_blocks = stage1_bitmask(p.input, length, bm, bm_cap,
-                                                  dirty_flags);
-
-            SiIter it;
-            si_init(&it, bm, num_blocks);
-
-            if (UNLIKELY(!si_has(&it))) {
+        if ((numeric < 56 || length > (8u * 1024u * 1024u)) && ws < 48) {
+            uint32_t max_blocks = (length + 63) / 64;
+            uint64_t *bm_out = (uint64_t *)arena->structural;
+            uint8_t *dirty = (uint8_t *)(bm_out + max_blocks);
+            uint8_t any_dirty = 0;
+            uint32_t num_blocks = stage1_bitmask(p.input, length,
+                                                  bm_out, max_blocks,
+                                                  dirty,
+                                                  &any_dirty);
+            if (UNLIKELY(num_blocks == 0)) {
                 JbinResult r = { JBIN_ERR_EMPTY, 0, JBIN_NONE };
                 return r;
             }
 
-            uint8_t any_dirty = 0;
-            for (uint32_t i = 0; i < num_blocks; i++) any_dirty |= dirty_flags[i];
-
-            uint32_t root = any_dirty
-                ? stage2_bitmask(&p, &it, dirty_flags)
-                : stage2_clean(&p, &it);
+            SiIter it;
+            si_init(&it, bm_out, num_blocks);
+            uint32_t root;
+            arena->is_tape = 1;
+            root = any_dirty
+                ? stage2_tape_bitmask(&p, &it, dirty)
+                : stage2_tape_clean(&p, &it);
             arena->node_count = p.node_count;
             if (UNLIKELY(root == JBIN_NONE)) {
                 JbinResult r = { p.error, p.error_pos, JBIN_NONE };

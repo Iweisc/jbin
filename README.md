@@ -10,30 +10,40 @@ A high-performance freestanding C11 JSON parser.
 
 ## Benchmarks
 
-Head-to-head vs simdjson (DOM API) on AMD Ryzen 5 7500F (Zen 4), GCC 13.3, PGO+LTO, best-of-1000:
+AMD Ryzen 5 7500F (Zen 4), Clang PGO+LTO, median of 1000 iterations.
 
-| File | Size | jbin (GB/s) | simdjson (GB/s) | Winner |
+### All parsers (GB/s, standard benchmark files)
+
+| File | Size | jbin | simdjson | yyjson | sajson | rapidjson | cJSON |
+|---|---|---|---|---|---|---|---|
+| canada.json | 2.15 MB | **2.19** | 1.46 | 1.34 | 0.62 | 0.72 | 0.13 |
+| citm_catalog.json | 1.65 MB | **6.53** | 5.59 | 3.88 | 1.94 | 1.15 | 0.69 |
+| twitter.json | 0.60 MB | 4.55 | **5.53** | 3.57 | 2.22 | 0.72 | 0.54 |
+
+### jbin vs simdjson (GB/s, full suite)
+
+| File | Size | jbin | simdjson | Winner |
 |---|---|---|---|---|
-| canada.json | 2.15 MB | **2.48** | 1.37 | jbin 1.82x |
-| citm_catalog.json | 1.65 MB | **5.71** | 4.09 | jbin 1.39x |
-| large.json | 118.78 MB | **2.22** | 1.88 | jbin 1.19x |
-| flat_kv.json | 5.57 MB | **6.21** | 3.92 | jbin 1.58x |
-| mesh.pretty.json | 1.50 MB | **4.17** | 2.29 | jbin 1.82x |
-| instruments.json | 0.21 MB | **5.02** | 3.77 | jbin 1.33x |
-| integers.json | 5.24 MB | **1.17** | 0.91 | jbin 1.29x |
-| deep_nested.json | 0.43 MB | **2.13** | 1.74 | jbin 1.23x |
-| numbers.json | 12.67 MB | **1.60** | 1.38 | jbin 1.16x |
-| mixed_types.json | 3.96 MB | **1.73** | 1.49 | jbin 1.17x |
-| apache_builds.json | 0.12 MB | **5.50** | 4.93 | jbin 1.12x |
-| github_events.json | 0.06 MB | **5.91** | 5.27 | jbin 1.12x |
-| github_events_large.json | 24.93 MB | **3.57** | 3.51 | jbin 1.02x |
-| mesh.json | 0.69 MB | 1.35 | **1.40** | simdjson 1.04x |
-| update-center.json | 0.51 MB | 4.31 | **4.38** | simdjson 1.02x |
-| twitter.json | 0.60 MB | 3.28 | **4.72** | simdjson 1.44x |
-| escape_heavy.json | 5.18 MB | 1.20 | **2.00** | simdjson 1.67x |
-| string_array.json | 6.53 MB | 1.23 | **2.06** | simdjson 1.67x |
+| canada.json | 2.15 MB | **2.19** | 1.46 | jbin 1.49x |
+| citm_catalog.json | 1.65 MB | **6.53** | 5.59 | jbin 1.17x |
+| flat_kv.json | 5.57 MB | **6.97** | 6.46 | jbin 1.08x |
+| mesh.pretty.json | 1.50 MB | **4.38** | 2.44 | jbin 1.80x |
+| instruments.json | 0.21 MB | **5.48** | 4.55 | jbin 1.21x |
+| integers.json | 5.24 MB | **1.12** | 0.88 | jbin 1.27x |
+| deep_nested.json | 0.43 MB | **2.79** | 2.07 | jbin 1.35x |
+| mixed_types.json | 3.96 MB | **1.93** | 1.67 | jbin 1.16x |
+| apache_builds.json | 0.12 MB | **6.49** | 4.73 | jbin 1.37x |
+| github_events.json | 0.06 MB | **6.98** | 6.02 | jbin 1.16x |
+| booleans.json | 1.02 MB | **1.00** | 0.91 | jbin 1.10x |
+| mesh.json | 0.69 MB | **2.36** | 1.46 | jbin 1.62x |
+| truenull.json | 0.01 MB | **3.90** | 3.07 | jbin 1.27x |
+| update-center.json | 0.51 MB | **5.53** | 4.43 | jbin 1.25x |
+| whitespace.json | 0.01 MB | **34.63** | 19.96 | jbin 1.73x |
+| twitter.json | 0.60 MB | 4.55 | **5.53** | simdjson 1.22x |
+| escape_heavy.json | 5.18 MB | 1.18 | **2.58** | simdjson 2.18x |
+| string_array.json | 6.53 MB | 1.21 | **1.85** | simdjson 1.53x |
 
-jbin wins **14/18** categories. It dominates on number-heavy, structural, and large inputs where SWAR/AVX2 digit scanning, SIMD structural indexing, and compact node layout give it an edge. simdjson wins on string-heavy inputs where its tape format avoids per-string node allocation.
+jbin wins **15/18** files. It dominates on number-heavy, structural, and large inputs where SWAR/AVX2 digit scanning, SIMD structural indexing, and compact node layout give it an edge. simdjson wins on string-heavy inputs where its tape format avoids per-string node allocation.
 
 ## Building
 
@@ -45,16 +55,31 @@ make check
 make bench
 ./bench -n100
 
-# PGO+LTO benchmark build (recommended)
-make bench-pgo
+# PGO+LTO benchmark build (recommended for reproducing numbers above)
+make bench-pgo-clang
 ./bench -n1000
-
-# Compare against simdjson
-make bench-simdjson
-./bench-simdjson -n1000
 
 # Verify freestanding compilation
 make freestanding-check
+```
+
+## Reproducing Benchmarks
+
+Comparison benchmarks require vendored library sources in the repo (`simdjson/`, `yyjson/`, `cjson/`, `rapidjson/`, `sajson/`).
+
+```sh
+# Build and run any comparison benchmark
+make bench-simdjson  && ./bench-simdjson -n1000
+make bench-yyjson    && ./bench-yyjson -n1000
+make bench-rapidjson && ./bench-rapidjson -n1000
+make bench-cjson     && ./bench-cjson -n1000
+make bench-sajson    && ./bench-sajson -n1000
+```
+
+Some data files are generated. Recreate them before benchmarking:
+
+```sh
+python3 scripts/gen_large.py > data/large.json
 ```
 
 ## Usage

@@ -106,6 +106,21 @@ int main(int argc, char **argv) {
         bench_file("data/twitter.json", iters, warmup);
         bench_file("data/citm_catalog.json", iters, warmup);
         bench_file("data/large.json", iters, warmup);
+        bench_file("data/apache_builds.json", iters, warmup);
+        bench_file("data/booleans.json", iters, warmup);
+        bench_file("data/deep_nested.json", iters, warmup);
+        bench_file("data/escape_heavy.json", iters, warmup);
+        bench_file("data/flat_kv.json", iters, warmup);
+        bench_file("data/github_events.json", iters, warmup);
+        bench_file("data/instruments.json", iters, warmup);
+        bench_file("data/integers.json", iters, warmup);
+        bench_file("data/mesh.json", iters, warmup);
+        bench_file("data/mesh.pretty.json", iters, warmup);
+        bench_file("data/mixed_types.json", iters, warmup);
+        bench_file("data/string_array.json", iters, warmup);
+        bench_file("data/truenull.json", iters, warmup);
+        bench_file("data/update-center.json", iters, warmup);
+        bench_file("data/whitespace.json", iters, warmup);
     }
 
     free(arena);
